@@ -1276,7 +1276,7 @@ msgstr "%u Rango DHCP disponible: %s -- %s"
 msgid "disabled"
 msgstr "deshabilitado"
 
-#: rfc2131.c:466 rfc2131.c:969 rfc2131.c:1335
+#: rfc2131.c:466 rfc2131.c:969 rfc2131.c:1336
 msgid "ignored"
 msgstr "ignorado"
 
@@ -1376,51 +1376,51 @@ msgstr "dirección reservada"
 msgid "abandoning lease to %s of %s"
 msgstr "abandonando arriendo a %s de %s"
 
-#: rfc2131.c:1757
+#: rfc2131.c:1758
 #, c-format
 msgid "%u tags: %s"
 msgstr "%u etiquetas: %s"
 
-#: rfc2131.c:1770
+#: rfc2131.c:1771
 #, c-format
 msgid "%u bootfile name: %s"
 msgstr "%u nombre de bootfile: %s"
 
-#: rfc2131.c:1779
+#: rfc2131.c:1780
 #, c-format
 msgid "%u server name: %s"
 msgstr "%u nombre de servidor: %s"
 
-#: rfc2131.c:1793
+#: rfc2131.c:1794
 #, fuzzy, c-format
 msgid "%u next server: %s"
 msgstr "%u siguiente servidor: %s"
 
-#: rfc2131.c:1796
+#: rfc2131.c:1797
 #, c-format
 msgid "%u broadcast response"
 msgstr ""
 
-#: rfc2131.c:1859
+#: rfc2131.c:1860
 #, fuzzy, c-format
 msgid "cannot send DHCP/BOOTP option %d: no space left in packet"
 msgstr "no se puede enviar opción DHCP/BOOTP %d: no queda espacio en paquete"
 
-#: rfc2131.c:2105
+#: rfc2131.c:2106
 msgid "PXE menu too large"
 msgstr "menú PXE demasiado grande"
 
-#: rfc2131.c:2218
+#: rfc2131.c:2219
 #, c-format
 msgid "Ignoring domain %s for DHCP host name %s"
 msgstr "Ignorando dominio %s para nombre de host DHCP %s"
 
-#: rfc2131.c:2236
+#: rfc2131.c:2237
 #, fuzzy, c-format
 msgid "%u requested options: %s"
 msgstr "%u opciones solicitadas: %s"
 
-#: rfc2131.c:2503
+#: rfc2131.c:2504
 #, c-format
 msgid "cannot send RFC3925 option: too many options for enterprise number %d"
 msgstr "no se puede enviar opción RFC3925: demasiadas opciones para número enterprise %d"

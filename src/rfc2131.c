@@ -1235,6 +1235,7 @@ size_t dhcp_reply(struct dhcp_context *context, char *iface_name, int int_index,
 	      
 	      lease->changed = 1;
 	      free(lease->extradata);
+	      lease->extradata = NULL;
 	      lease->extradata_size = lease->extradata_len = 0;
 	      
 	      add_extradata_opt(lease, option_find(mess, sz, OPTION_VENDOR_ID, 1));

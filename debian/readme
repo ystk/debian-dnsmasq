@@ -30,7 +30,13 @@ Notes on configuring dnsmasq as packaged for Debian.
     generated file /etc/ppp/resolv.conf.  You should list 127.0.0.1
     as the first nameserver address in /etc/resolv.conf.
 
-(6) If you run multiple DNS servers on a single machine, each
+(6) In the absence of resolvconf, dns-nameservers lines in 
+    /etc/network/interfaces are ignored. If you do do not use
+    resolvconf, list 127.0.0.1 as the first nameserver address
+    in /etc/resolv.conf and configure your nameservers using
+    "server=<IP-address>" lines in /etc/dnsmasq.conf.
+
+(7) If you run multiple DNS servers on a single machine, each
     listening on a different interface, then it is necessary to use 
     the bind-interfaces option by uncommenting "bind-interfaces" in 
     /etc/dnsmasq.conf. This option stops dnsmasq from binding the 
@@ -40,22 +46,31 @@ Notes on configuring dnsmasq as packaged for Debian.
     which does this so that the "system" dnsmasq and "private" dnsmasq
     instances started by libvirt do not clash.
 
-(7) The following options are supported in DEB_BUILD_OPTIONS
-      noopt    : compile without optimisation.
-      nostrip  : don't remove symbols from binary. 
-      nodocs   : omit documentation.
-      notftp   : omit TFTP support.
-      nodhcp   : omit DHCP support.
-      noscript : omit lease-change script support.
-      noipv6   : omit IPv6 support.
-      nodbus   : omit DBus support.
-      nortc    : compile alternate mode suitable for systems without an RTC.
-      noi18n   : omit translations and internationalisation support.
+(8) The following options are supported in DEB_BUILD_OPTIONS
+      noopt       : compile without optimisation.
+      nostrip     : don't remove symbols from binary. 
+      nodocs      : omit documentation.
+      notftp      : omit TFTP support.
+      nodhcp      : omit DHCP support.
+      nodhcp6     : omit DHCPv6 support.
+      noscript    : omit lease-change script support.
+      use_lua     : provide support for lease-change scripts written
+                    in Lua.
+      noipv6      : omit IPv6 support.
+      nodbus      : omit DBus support.
+      noconntrack : omit connection tracking support. 
+      nortc       : compile alternate mode suitable for systems without an RTC.
+      noi18n      : omit translations and internationalisation support.
+      noidn       : omit international domain name support, must be
+                    combined with noi18n to be effective.
+      
 
-(8) Dnsmasq comes as two packages - dnsmasq-base and
-    dnsmasq. dnsmasq-base provides the dnsmasq executable and
+(9) Dnsmasq comes as three packages - dnsmasq-utils, dnsmasq-base and
+    dnsmasq. Dnsmasq-base provides the dnsmasq executable and
     documentation (including this file). Dnsmasq, which depends on
     dnsmasq-base, provides the init script and configuration
     infrastructure. This file assumes that both are installed. It is
     possible to install only dnsmasq-base and use dnsmasq as a
     non-"system" daemon. Libvirt, for instance, does this.
+    Dnsmasq-utils provides the utilities dhcp_release and 
+    dhcp_lease_time.

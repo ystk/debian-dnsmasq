@@ -1,4 +1,4 @@
-/* dnsmasq is Copyright (c) 2000-2012 Simon Kelley
+/* dnsmasq is Copyright (c) 2000-2014 Simon Kelley
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -91,6 +91,7 @@ struct dhcp_netid *option_filter(struct dhcp_netid *tags, struct dhcp_netid *con
 {
   struct dhcp_netid *tagif = run_tag_if(tags);
   struct dhcp_opt *opt;
+  struct dhcp_opt *tmp;  
 
   /* flag options which are valid with the current tag set (sans context tags) */
   for (opt = opts; opt; opt = opt->next)
@@ -135,7 +136,6 @@ struct dhcp_netid *option_filter(struct dhcp_netid *tags, struct dhcp_netid *con
   for (opt = opts; opt; opt = opt->next)
     if (!(opt->flags & (DHOPT_ENCAPSULATE | DHOPT_VENDOR | DHOPT_RFC3925 | DHOPT_TAGOK)) && !opt->netid)
       {
-	struct dhcp_opt *tmp;  
 	for (tmp = opts; tmp; tmp = tmp->next) 
 	  if (tmp->opt == opt->opt && (tmp->flags & DHOPT_TAGOK))
 	    break;
@@ -145,6 +145,13 @@ struct dhcp_netid *option_filter(struct dhcp_netid *tags, struct dhcp_netid *con
 	  my_syslog(MS_DHCP | LOG_WARNING, _("Ignoring duplicate dhcp-option %d"), tmp->opt); 
       }
 
+  /* Finally, eliminate duplicate options later in the chain, and therefore earlier in the config file. */
+  for (opt = opts; opt; opt = opt->next)
+    if (opt->flags & DHOPT_TAGOK)
+      for (tmp = opt->next; tmp; tmp = tmp->next) 
+	if (tmp->opt == opt->opt)
+	  tmp->flags &= ~DHOPT_TAGOK;
+  
   return tagif;
 }
 	
@@ -246,38 +253,108 @@ int match_bytes(struct dhcp_opt *o, unsigned char *p, int len)
   return 0;
 }
 
-void check_dhcp_hosts(int fatal)
+int config_has_mac(struct dhcp_config *config, unsigned char *hwaddr, int len, int type)
 {
-  /* If the same IP appears in more than one host config, then DISCOVER
-     for one of the hosts will get the address, but REQUEST will be NAKed,
-     since the address is reserved by the other one -> protocol loop. 
-     Also check that FQDNs match the domain we are using. */
+  struct hwaddr_config *conf_addr;
   
-  struct dhcp_config *configs, *cp;
- 
-  for (configs = daemon->dhcp_conf; configs; configs = configs->next)
-    {
-      char *domain;
+  for (conf_addr = config->hwaddr; conf_addr; conf_addr = conf_addr->next)
+    if (conf_addr->wildcard_mask == 0 &&
+	conf_addr->hwaddr_len == len &&
+	(conf_addr->hwaddr_type == type || conf_addr->hwaddr_type == 0) &&
+	memcmp(conf_addr->hwaddr, hwaddr, len) == 0)
+      return 1;
+  
+  return 0;
+}
 
-      if ((configs->flags & DHOPT_BANK) || fatal)
-       {
-	 for (cp = configs->next; cp; cp = cp->next)
-	   if ((configs->flags & cp->flags & CONFIG_ADDR) && configs->addr.s_addr == cp->addr.s_addr)
-	     {
-	       if (fatal)
-		 die(_("duplicate IP address %s in dhcp-config directive."), 
-		     inet_ntoa(cp->addr), EC_BADCONF);
-	       else
-		 my_syslog(MS_DHCP | LOG_ERR, _("duplicate IP address %s in %s."), 
-			   inet_ntoa(cp->addr), daemon->dhcp_hosts_file);
-	       configs->flags &= ~CONFIG_ADDR;
-	     }
-	 
-	 /* split off domain part */
-	 if ((configs->flags & CONFIG_NAME) && (domain = strip_hostname(configs->hostname)))
-	   configs->domain = domain;
-       }
-    }
+static int is_config_in_context(struct dhcp_context *context, struct dhcp_config *config)
+{
+  if (!context) /* called via find_config() from lease_update_from_configs() */
+    return 1; 
+
+  if (!(config->flags & (CONFIG_ADDR | CONFIG_ADDR6)))
+    return 1;
+  
+#ifdef HAVE_DHCP6
+  if ((context->flags & CONTEXT_V6) && (config->flags & CONFIG_WILDCARD))
+    return 1;
+#endif
+
+  for (; context; context = context->current)
+#ifdef HAVE_DHCP6
+    if (context->flags & CONTEXT_V6) 
+      {
+	if ((config->flags & CONFIG_ADDR6) && is_same_net6(&config->addr6, &context->start6, context->prefix))
+	  return 1;
+      }
+    else 
+#endif
+      if ((config->flags & CONFIG_ADDR) && is_same_net(config->addr, context->start, context->netmask))
+	return 1;
+
+  return 0;
+}
+
+struct dhcp_config *find_config(struct dhcp_config *configs,
+				struct dhcp_context *context,
+				unsigned char *clid, int clid_len,
+				unsigned char *hwaddr, int hw_len, 
+				int hw_type, char *hostname)
+{
+  int count, new;
+  struct dhcp_config *config, *candidate; 
+  struct hwaddr_config *conf_addr;
+
+  if (clid)
+    for (config = configs; config; config = config->next)
+      if (config->flags & CONFIG_CLID)
+	{
+	  if (config->clid_len == clid_len && 
+	      memcmp(config->clid, clid, clid_len) == 0 &&
+	      is_config_in_context(context, config))
+	    return config;
+	  
+	  /* dhcpcd prefixes ASCII client IDs by zero which is wrong, but we try and
+	     cope with that here. This is IPv4 only. context==NULL implies IPv4, 
+	     see lease_update_from_configs() */
+	  if ((!context || !(context->flags & CONTEXT_V6)) && *clid == 0 && config->clid_len == clid_len-1  &&
+	      memcmp(config->clid, clid+1, clid_len-1) == 0 &&
+	      is_config_in_context(context, config))
+	    return config;
+	}
+  
+
+  if (hwaddr)
+    for (config = configs; config; config = config->next)
+      if (config_has_mac(config, hwaddr, hw_len, hw_type) &&
+	  is_config_in_context(context, config))
+	return config;
+  
+  if (hostname && context)
+    for (config = configs; config; config = config->next)
+      if ((config->flags & CONFIG_NAME) && 
+	  hostname_isequal(config->hostname, hostname) &&
+	  is_config_in_context(context, config))
+	return config;
+
+  
+  if (!hwaddr)
+    return NULL;
+
+  /* use match with fewest wildcard octets */
+  for (candidate = NULL, count = 0, config = configs; config; config = config->next)
+    if (is_config_in_context(context, config))
+      for (conf_addr = config->hwaddr; conf_addr; conf_addr = conf_addr->next)
+	if (conf_addr->wildcard_mask != 0 &&
+	    conf_addr->hwaddr_len == hw_len &&	
+	    (conf_addr->hwaddr_type == hw_type || conf_addr->hwaddr_type == 0) &&
+	    (new = memcmp_masked(conf_addr->hwaddr, hwaddr, hw_len, conf_addr->wildcard_mask)) > count)
+	  {
+	      count = new;
+	      candidate = config;
+	  }
+  
+  return candidate;
 }
 
 void dhcp_update_configs(struct dhcp_config *configs)
@@ -289,7 +366,7 @@ void dhcp_update_configs(struct dhcp_config *configs)
      in at most one dhcp-host. Since /etc/hosts can be re-read by SIGHUP, 
      restore the status-quo ante first. */
   
-  struct dhcp_config *config;
+  struct dhcp_config *config, *conf_tmp;
   struct crec *crec;
   int prot = AF_INET;
 
@@ -322,16 +399,17 @@ void dhcp_update_configs(struct dhcp_config *configs)
 	    if (cache_find_by_name(crec, config->hostname, 0, cacheflags))
 	      {
 		/* use primary (first) address */
-	      while (crec && !(crec->flags & F_REVERSE))
-		crec = cache_find_by_name(crec, config->hostname, 0, cacheflags);
-	      if (!crec)
-		continue; /* should be never */
-	      inet_ntop(prot, &crec->addr.addr, daemon->addrbuff, ADDRSTRLEN);
-	      my_syslog(MS_DHCP | LOG_WARNING, _("%s has more than one address in hostsfile, using %s for DHCP"), 
-			config->hostname, daemon->addrbuff);
+		while (crec && !(crec->flags & F_REVERSE))
+		  crec = cache_find_by_name(crec, config->hostname, 0, cacheflags);
+		if (!crec)
+		  continue; /* should be never */
+		inet_ntop(prot, &crec->addr.addr, daemon->addrbuff, ADDRSTRLEN);
+		my_syslog(MS_DHCP | LOG_WARNING, _("%s has more than one address in hostsfile, using %s for DHCP"), 
+			  config->hostname, daemon->addrbuff);
 	      }
 	    
-	    if (prot == AF_INET && !config_find_by_address(configs, crec->addr.addr.addr.addr4))
+	    if (prot == AF_INET && 
+		(!(conf_tmp = config_find_by_address(configs, crec->addr.addr.addr.addr4)) || conf_tmp == config))
 	      {
 		config->addr = crec->addr.addr.addr.addr4;
 		config->flags |= CONFIG_ADDR | CONFIG_ADDR_HOSTS;
@@ -339,7 +417,8 @@ void dhcp_update_configs(struct dhcp_config *configs)
 	      }
 
 #ifdef HAVE_DHCP6
-	    if (prot == AF_INET6 && !config_find_by_address6(configs, &crec->addr.addr.addr.addr6, 128, 0))
+	    if (prot == AF_INET6 && 
+		(!(conf_tmp = config_find_by_address6(configs, &crec->addr.addr.addr.addr6, 128, 0)) || conf_tmp == config))
 	      {
 		memcpy(&config->addr6, &crec->addr.addr.addr.addr6, IN6ADDRSZ);
 		config->flags |= CONFIG_ADDR6 | CONFIG_ADDR_HOSTS;
@@ -365,103 +444,29 @@ void dhcp_update_configs(struct dhcp_config *configs)
 
 }
 
-#ifdef HAVE_DHCP6
-static int join_multicast_worker(struct in6_addr *local, int prefix, 
-				 int scope, int if_index, int dad, void *vparam)
-{
-  char ifrn_name[IFNAMSIZ];
-  struct ipv6_mreq mreq;
-  int fd, i, max = *((int *)vparam);
-  struct dhcp_context *context;
-  struct iname *tmp;
-
-  (void)prefix;
-  (void)scope;
-  (void)dad;
-  
-  /* record which interfaces we join on, so that we do it at most one per 
-     interface, even when they have multiple addresses. Use outpacket
-     as an array of int, since it's always allocated here and easy
-     to expand for theoretical vast numbers of interfaces. */
-  for (i = 0; i < max; i++)
-    if (if_index == ((int *)daemon->outpacket.iov_base)[i])
-      return 1;
-  
-  if ((fd = socket(PF_INET6, SOCK_DGRAM, 0)) == -1)
-    return 0;
-  
-  if (!indextoname(fd, if_index, ifrn_name))
-    {
-      close(fd);
-      return 0;
-    }
-  
-  close(fd);
-
-  /* Are we doing DHCP on this interface? */
-  if (!iface_check(AF_INET6, (struct all_addr *)local, ifrn_name))
-    return 1;
- 
-  for (tmp = daemon->dhcp_except; tmp; tmp = tmp->next)
-    if (tmp->name && (strcmp(tmp->name, ifrn_name) == 0))
-      return 1;
-
-  /* weird libvirt-inspired access control */
-  for (context = daemon->ra_contexts ? daemon->ra_contexts : daemon->dhcp6; 
-       context; context = context->next)
-    if (!context->interface || strcmp(context->interface, ifrn_name) == 0)
-      break;
-  
-  if (!context)
-    return 1;
-  
-  mreq.ipv6mr_interface = if_index;
-  
-  inet_pton(AF_INET6, ALL_RELAY_AGENTS_AND_SERVERS, &mreq.ipv6mr_multiaddr);
-  
-  if (daemon->dhcp6 &&
-      setsockopt(daemon->dhcp6fd, IPPROTO_IPV6, IPV6_JOIN_GROUP, &mreq, sizeof(mreq)) == -1)
-    return 0;
-
-  inet_pton(AF_INET6, ALL_SERVERS, &mreq.ipv6mr_multiaddr);
-  
-  if (daemon->dhcp6 && 
-      setsockopt(daemon->dhcp6fd, IPPROTO_IPV6, IPV6_JOIN_GROUP, &mreq, sizeof(mreq)) == -1)
-    return 0;
-  
-  inet_pton(AF_INET6, ALL_ROUTERS, &mreq.ipv6mr_multiaddr);
-  
-  if (daemon->ra_contexts &&
-      setsockopt(daemon->icmp6fd, IPPROTO_IPV6, IPV6_JOIN_GROUP, &mreq, sizeof(mreq)) == -1)
-    return 0;
-  
-  expand_buf(&daemon->outpacket, (max+1) * sizeof(int));
-  ((int *)daemon->outpacket.iov_base)[max++] = if_index;
-  
-  *((int *)vparam) = max;
-  
-  return 1;
-}
-
-void join_multicast(void)
-{
-  int count = 0;
-
-   if (!iface_enumerate(AF_INET6, &count, join_multicast_worker))
-     die(_("failed to join DHCPv6 multicast group: %s"), NULL, EC_BADNET);
-}
-#endif
-
 #ifdef HAVE_LINUX_NETWORK 
-void bindtodevice(int fd)
+char *whichdevice(void)
 {
   /* If we are doing DHCP on exactly one interface, and running linux, do SO_BINDTODEVICE
      to that device. This is for the use case of  (eg) OpenStack, which runs a new
      dnsmasq instance for each VLAN interface it creates. Without the BINDTODEVICE, 
      individual processes don't always see the packets they should.
-     SO_BINDTODEVICE is only available Linux. */
+     SO_BINDTODEVICE is only available Linux. 
+
+     Note that if wildcards are used in --interface, or --interface is not used at all,
+     or a configured interface doesn't yet exist, then more interfaces may arrive later, 
+     so we can't safely assert there is only one interface and proceed.
+*/
   
   struct irec *iface, *found;
+  struct iname *if_tmp;
+  
+  if (!daemon->if_names)
+    return NULL;
+  
+  for (if_tmp = daemon->if_names; if_tmp; if_tmp = if_tmp->next)
+    if (if_tmp->name && (!if_tmp->used || strchr(if_tmp->name, '*')))
+      return NULL;
 
   for (found = NULL, iface = daemon->interfaces; iface; iface = iface->next)
     if (iface->dhcp_ok)
@@ -469,22 +474,24 @@ void bindtodevice(int fd)
 	if (!found)
 	  found = iface;
 	else if (strcmp(found->name, iface->name) != 0) 
-	  {
-	    /* more than one. */
-	    found = NULL;
-	    break;
-	  }
+	  return NULL; /* more than one. */
       }
-  
+
   if (found)
-	{
-	  struct ifreq ifr;
-	  strcpy(ifr.ifr_name, found->name);
-	  /* only allowed by root. */
-	  if (setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, (void *)&ifr, sizeof(ifr)) == -1 &&
-	      errno != EPERM)
-	    die(_("failed to set SO_BINDTODEVICE on DHCP socket: %s"), NULL, EC_BADNET);
-	}
+    return found->name;
+
+  return NULL;
+}
+ 
+void  bindtodevice(char *device, int fd)
+{
+  struct ifreq ifr;
+  
+  strcpy(ifr.ifr_name, device);
+  /* only allowed by root. */
+  if (setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, (void *)&ifr, sizeof(ifr)) == -1 &&
+      errno != EPERM)
+    die(_("failed to set SO_BINDTODEVICE on DHCP socket: %s"), NULL, EC_BADNET);
 }
 #endif
 
@@ -531,15 +538,15 @@ static const struct opttab_t {
   { "x-windows-fs", 48, OT_ADDR_LIST },
   { "x-windows-dm", 49, OT_ADDR_LIST },
   { "requested-address", 50, OT_INTERNAL | OT_ADDR_LIST },
-  { "lease-time", 51, OT_INTERNAL | OT_DEC },
+  { "lease-time", 51, OT_INTERNAL | OT_TIME },
   { "option-overload", 52, OT_INTERNAL },
   { "message-type", 53, OT_INTERNAL | OT_DEC },
   { "server-identifier", 54, OT_INTERNAL | OT_ADDR_LIST },
   { "parameter-request", 55, OT_INTERNAL },
   { "message", 56, OT_INTERNAL },
   { "max-message-size", 57, OT_INTERNAL },
-  { "T1", 58, OT_INTERNAL | OT_DEC},
-  { "T2", 59, OT_INTERNAL | OT_DEC},
+  { "T1", 58, OT_INTERNAL | OT_TIME},
+  { "T2", 59, OT_INTERNAL | OT_TIME},
   { "vendor-class", 60, 0 },
   { "client-id", 61, OT_INTERNAL },
   { "nis+-domain", 64, OT_NAME },
@@ -590,6 +597,7 @@ static const struct opttab_t opttab6[] = {
   { "nis-domain", 29,  OT_RFC1035_NAME },
   { "nis+-domain", 30, OT_RFC1035_NAME },
   { "sntp-server", 31,  OT_ADDR_LIST },
+  { "information-refresh-time", 32, OT_TIME },
   { "FQDN", 39, OT_INTERNAL | OT_RFC1035_NAME },
   { "ntp-server", 56,  OT_ADDR_LIST },
   { "bootfile-url", 59, OT_NAME },
@@ -623,10 +631,12 @@ void display_opts6(void)
 }
 #endif
 
-u16 lookup_dhcp_opt(int prot, char *name)
+int lookup_dhcp_opt(int prot, char *name)
 {
   const struct opttab_t *t;
   int i;
+
+  (void)prot;
 
 #ifdef HAVE_DHCP6
   if (prot == AF_INET6)
@@ -636,17 +646,18 @@ u16 lookup_dhcp_opt(int prot, char *name)
     t = opttab;
 
   for (i = 0; t[i].name; i++)
-    if (!(t[i].size & OT_INTERNAL) &&
-	strcasecmp(t[i].name, name) == 0)
+    if (strcasecmp(t[i].name, name) == 0)
       return t[i].val;
   
-  return 0;
+  return -1;
 }
 
-u16 lookup_dhcp_len(int prot, u16 val)
+int lookup_dhcp_len(int prot, int val)
 {
   const struct opttab_t *t;
   int i;
+
+  (void)prot;
 
 #ifdef HAVE_DHCP6
   if (prot == AF_INET6)
@@ -657,14 +668,9 @@ u16 lookup_dhcp_len(int prot, u16 val)
 
   for (i = 0; t[i].name; i++)
     if (val == t[i].val)
-      {
-	if (t[i].size & OT_INTERNAL)
-	  return 0;
-	
-	return t[i].size & ~OT_DEC;
-      }
- 
-  return 0;
+      return t[i].size & ~OT_DEC;
+
+   return 0;
 }
 
 char *option_string(int prot, unsigned int opt, unsigned char *val, int opt_len, char *buf, int buf_len)
@@ -754,14 +760,17 @@ char *option_string(int prot, unsigned int opt, unsigned char *val, int opt_len,
 		  }
 	      }	      
 #endif
-	    else if ((ot[o].size & OT_DEC) && opt_len != 0)
+	    else if ((ot[o].size & (OT_DEC | OT_TIME)) && opt_len != 0)
 	      {
 		unsigned int dec = 0;
 		
 		for (i = 0; i < opt_len; i++)
 		  dec = (dec << 8) | val[i]; 
 
-		sprintf(buf, "%u", dec);
+		if (ot[o].size & OT_TIME)
+		  prettyprint_time(buf, dec);
+		else
+		  sprintf(buf, "%u", dec);
 	      }
 	    else
 	      nodecode = 1;
@@ -788,4 +797,109 @@ char *option_string(int prot, unsigned int opt, unsigned char *val, int opt_len,
 
 }
 
+void log_context(int family, struct dhcp_context *context)
+{
+  /* Cannot use dhcp_buff* for RA contexts */
+
+  void *start = &context->start;
+  void *end = &context->end;
+  char *template = "", *p = daemon->namebuff;
+  
+  *p = 0;
+    
+#ifdef HAVE_DHCP6
+  if (family == AF_INET6)
+    {
+      struct in6_addr subnet = context->start6;
+      if (!(context->flags & CONTEXT_TEMPLATE))
+	setaddr6part(&subnet, 0);
+      inet_ntop(AF_INET6, &subnet, daemon->addrbuff, ADDRSTRLEN); 
+      start = &context->start6;
+      end = &context->end6;
+    }
+#endif
+
+  if (family != AF_INET && (context->flags & CONTEXT_DEPRECATE))
+    strcpy(daemon->namebuff, _(", prefix deprecated"));
+  else
+    {
+      p += sprintf(p, _(", lease time "));
+      prettyprint_time(p, context->lease_time);
+      p += strlen(p);
+    }	
+
+#ifdef HAVE_DHCP6
+  if (context->flags & CONTEXT_CONSTRUCTED)
+    {
+      char ifrn_name[IFNAMSIZ];
+      
+      template = p;
+      p += sprintf(p, ", ");
+      
+      if (indextoname(daemon->icmp6fd, context->if_index, ifrn_name))
+	sprintf(p, "%s for %s", (context->flags & CONTEXT_OLD) ? "old prefix" : "constructed", ifrn_name);
+    }
+  else if (context->flags & CONTEXT_TEMPLATE && !(context->flags & CONTEXT_RA_STATELESS))
+    {
+      template = p;
+      p += sprintf(p, ", ");
+      
+      sprintf(p, "template for %s", context->template_interface);  
+    }
+#endif
+     
+  if (!(context->flags & CONTEXT_OLD) &&
+      ((context->flags & CONTEXT_DHCP) || family == AF_INET)) 
+    {
+#ifdef HAVE_DHCP6
+      if (context->flags & CONTEXT_RA_STATELESS)
+	{
+	  if (context->flags & CONTEXT_TEMPLATE)
+	    strncpy(daemon->dhcp_buff, context->template_interface, 256);
+	  else
+	    strcpy(daemon->dhcp_buff, daemon->addrbuff);
+	}
+      else 
+#endif
+	inet_ntop(family, start, daemon->dhcp_buff, 256);
+      inet_ntop(family, end, daemon->dhcp_buff3, 256);
+      my_syslog(MS_DHCP | LOG_INFO, 
+		(context->flags & CONTEXT_RA_STATELESS) ? 
+		_("%s stateless on %s%.0s%.0s%s") :
+		(context->flags & CONTEXT_STATIC) ? 
+		_("%s, static leases only on %.0s%s%s%.0s") :
+		(context->flags & CONTEXT_PROXY) ?
+		_("%s, proxy on subnet %.0s%s%.0s%.0s") :
+		_("%s, IP range %s -- %s%s%.0s"),
+		(family != AF_INET) ? "DHCPv6" : "DHCP",
+		daemon->dhcp_buff, daemon->dhcp_buff3, daemon->namebuff, template);
+    }
+  
+#ifdef HAVE_DHCP6
+  if (context->flags & CONTEXT_TEMPLATE)
+    {
+      strcpy(daemon->addrbuff, context->template_interface);
+      template = "";
+    }
+
+  if ((context->flags & CONTEXT_RA_NAME) && !(context->flags & CONTEXT_OLD))
+    my_syslog(MS_DHCP | LOG_INFO, _("DHCPv4-derived IPv6 names on %s%s"), daemon->addrbuff, template);
+  
+  if ((context->flags & CONTEXT_RA) || (option_bool(OPT_RA) && (context->flags & CONTEXT_DHCP) && family == AF_INET6)) 
+    my_syslog(MS_DHCP | LOG_INFO, _("router advertisement on %s%s"), daemon->addrbuff, template);
+#endif
+
+}
+
+void log_relay(int family, struct dhcp_relay *relay)
+{
+  inet_ntop(family, &relay->local, daemon->addrbuff, ADDRSTRLEN);
+  inet_ntop(family, &relay->server, daemon->namebuff, ADDRSTRLEN); 
+
+  if (relay->interface)
+    my_syslog(MS_DHCP | LOG_INFO, _("DHCP relay from %s to %s via %s"), daemon->addrbuff, daemon->namebuff, relay->interface);
+  else
+    my_syslog(MS_DHCP | LOG_INFO, _("DHCP relay from %s to %s"), daemon->addrbuff, daemon->namebuff);
+}
+   
 #endif

@@ -1,10 +1,129 @@
-dnsmasq (2.62-3+deb7u1) testing-proposed-updates; urgency=low
+dnsmasq (2.71-1) unstable; urgency=low
 
-  * Non-maintainer upload.
-  * Backport fix for symlink attacks from 2.63-4
-    (Closes: #686484)
+   * New upstream.
+   * Fix 100% CPU-usage bug when dnsmasq started with cachesize 
+     set to zero. (LP: #1314697)
+	
+ -- Simon Kelley <simon@thekelleys.org.uk>  Fri, 16 May 2014 20:17:10 +0000
 
- -- Jonathan Wiltshire <jmw@debian.org>  Sun, 10 Feb 2013 21:07:17 +0000
+dnsmasq (2.70-3) unstable; urgency=medium
+
+   * Write a pid-file, even when being started using systemd, since
+     other components may wish to signal dnsmasq.
+   * Enable dnsmasq systemd unit on install. Otherwise dnsmasq does not run on
+     fresh installations (without administrator handholding) and even worse it
+     is disabled on systems switching from sysv to systemd. Modify
+     postinst/postrm exactly as dh_systemd would, add dependency on
+     init-system-helpers. Closes: #724602
+
+ -- Simon Kelley <simon@thekelleys.org.uk> Sun, 11 May 2014 17:45:21 +0000
+
+dnsmasq (2.70-2) unstable; urgency=low
+
+   * Ensure daemon not stared if dnsmasq package has been removed,
+     even if dnsmasq-base is still installed. (closes: #746941)
+   * Tidy cruft in initscript. (closes: #746940)
+
+ -- Simon Kelley <simon@thekelleys.org.uk>  Sun, 04 May 2014 21:34:11 +0000
+
+dnsmasq (2.70-1) unstable; urgency=low
+
+   * New upstream.
+
+ -- Simon Kelley <simon@thekelleys.org.uk>  Wed, 23 Apr 2014 15:14:42 +0000
+
+dnsmasq (2.69-1) unstable; urgency=low
+
+   * New upstream.
+   * Set --local-service. (closes: #732610)
+     This tells dnsmasq to ignore DNS requests that don't come
+     from a local network. It's automatically ignored if
+     --interface --except-interface, --listen-address or
+     --auth-server exist in the configuration, so for most
+     installations, it will have no effect, but for
+     otherwise-unconfigured installations, it stops dnsmasq
+     from being vulnerable to DNS-reflection attacks.
+
+ -- Simon Kelley <simon@thekelleys.org.uk>  Tue, 4 Feb 2014 16:28:12 +0000
+
+dnsmasq (2.68-1) unstable; urgency=low
+
+   * New upstream. (closes: #730553)
+
+ -- Simon Kelley <simon@thekelleys.org.uk>  Sun, 8 Dec 2013 15:57:32 +0000
+
+dnsmasq (2.67-1) unstable; urgency=low
+
+   * New upstream.
+   * Update resolvconf script. (closes: #720732)
+
+ -- Simon Kelley <simon@thekelleys.org.uk>  Wed, 4 Aug 2013 14:53:22 +0000
+
+dnsmasq (2.66-4) unstable; urgency=low
+
+   * Update resolvconf script. (closes: #716908)
+
+ -- Simon Kelley <simon@thekelleys.org.uk>  Wed, 4 Aug 2013 14:48:21 +0000
+
+dnsmasq (2.66-3) unstable; urgency=low
+
+   * Update resolvconf script for dnscrypt-proxy integration. (closes: #709179)
+
+ -- Simon Kelley <simon@thekelleys.org.uk>  Tue, 28 May 2013 14:39:51 +0000
+
+dnsmasq (2.66-2) unstable; urgency=low
+
+   * Fix error on startup with some configs. (closes: #709010)
+
+ -- Simon Kelley <simon@thekelleys.org.uk>  Mon, 20 May 2013 11:46:11 +0000
+
+dnsmasq (2.66-1) unstable; urgency=low
+
+   * New upstream.
+   * Add support for noipset in DEB_BUILD_OPTIONS.
+
+ -- Simon Kelley <simon@thekelleys.org.uk>  Fri, 22 Feb 2013 21:52:13 +0000
+
+dnsmasq (2.65-1) unstable; urgency=low
+
+   * New upstream.
+
+ -- Simon Kelley <simon@thekelleys.org.uk>  Fri, 14 Dec 2012 11:34:12 +0000
+
+dnsmasq (2.64-1) unstable; urgency=low
+
+   * New upstream.
+
+ -- Simon Kelley <simon@thekelleys.org.uk>  Fri, 21 Sep 2012 17:17:22 +0000
+
+dnsmasq (2.63-4) unstable; urgency=low
+
+   * Make pid-file creation immune to symlink attacks. (closes: #686484)
+
+ -- Simon Kelley <simon@thekelleys.org.uk>  Fri, 21 Sep 2012 17:16:34 +0000
+
+dnsmasq (2.63-3) unstable; urgency=low
+
+   * Move adduser dependency to dnsmasq-base. (closes: #686694)
+
+ -- Simon Kelley <simon@thekelleys.org.uk>  Tue, 4 Sep 2012 21:44:15 +0000
+
+dnsmasq (2.63-2) unstable; urgency=low
+
+   * Fix version script to report correct version.
+   * Unbotch move of dbus config file by using correct versions in
+     Replaces: and Breaks: lines. (closes: #685204)
+   * Create dnsmasq user in dnsmasq-base so that Dbus doesn't complain if
+     only dnsmasq-base is installed. (closes: #685987)
+
+ -- Simon Kelley <simon@thekelleys.org.uk>  Tue, 28 Aug 2012 16:18:35 +0000
+
+dnsmasq (2.63-1) unstable; urgency=low
+
+   * New upstream.
+   * Move /etc/dbus-1/system.d/dnsmasq.conf from dnsmasq to dnsmasq-base.
+
+ -- Simon Kelley <simon@thekelleys.org.uk>  Mon, 11 Jun 2012 21:55:35 +0000
 
 dnsmasq (2.62-3) unstable; urgency=low
 
@@ -17,7 +136,7 @@ dnsmasq (2.62-2) unstable; urgency=low
 
    * Pass LDFLAGS to make to get hardening in linker.
 
- -- Simon Kelley <simon@thekelleys.org.uk>  Thu, 7 June 2012 09:53:43 +0000
+ -- Simon Kelley <simon@thekelleys.org.uk>  Thu, 7 Jun 2012 09:53:43 +0000
 
 dnsmasq (2.62-1) unstable; urgency=low
 

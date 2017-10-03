@@ -2041,7 +2041,7 @@ size_t dnssec_generate_query(struct dns_header *header, char *end, char *name, i
 
   p = (unsigned char *)(header+1);
 	
-  p = do_rfc1035_name(p, name);
+  p = do_rfc1035_name(p, name, NULL);
   *p++ = 0;
   PUTSHORT(type, p);
   PUTSHORT(class, p);

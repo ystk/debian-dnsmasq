@@ -177,13 +177,6 @@ struct event_desc {
 #define EC_MISC        5
 #define EC_INIT_OFFSET 10
 
-/* Min buffer size: we check after adding each record, so there must be 
-   memory for the largest packet, and the largest record so the
-   min for DNS is PACKETSZ+MAXDNAME+RRFIXEDSZ which is < 1000.
-   This might be increased is EDNS packet size if greater than the minimum.
-*/
-#define DNSMASQ_PACKETSZ PACKETSZ+MAXDNAME+RRFIXEDSZ
-
 /* Trust the compiler dead-code eliminator.... */
 #define option_bool(x) (((x) < 32) ? daemon->options & (1u << (x)) : daemon->options2 & (1u << ((x) - 32)))
 
@@ -499,7 +492,7 @@ struct server {
   char interface[IF_NAMESIZE+1];
   struct serverfd *sfd; 
   char *domain; /* set if this server only handles a domain. */ 
-  int flags, tcpfd;
+  int flags, tcpfd, edns_pktsz;
   unsigned int queries, failed_queries;
 #ifdef HAVE_LOOP
   u32 uid;
@@ -576,6 +569,8 @@ struct hostsfile {
 #define FREC_DO_QUESTION       64
 #define FREC_ADDED_PHEADER    128
 #define FREC_CHECK_NOSIGN     256
+#define FREC_TEST_PKTSZ       512
+#define FREC_HAS_EXTRADATA    512        
 
 #ifdef HAVE_DNSSEC
 #define HASH_SIZE 20 /* SHA-1 digest size */
@@ -1117,7 +1112,7 @@ int in_zone(struct auth_zone *zone, char *name, char **cut);
 #endif
 
 /* dnssec.c */
-size_t dnssec_generate_query(struct dns_header *header, char *end, char *name, int class, int type, union mysockaddr *addr);
+size_t dnssec_generate_query(struct dns_header *header, char *end, char *name, int class, int type, union mysockaddr *addr, int edns_pktsz);
 int dnssec_validate_by_ds(time_t now, struct dns_header *header, size_t n, char *name, char *keyname, int class);
 int dnssec_validate_ds(time_t now, struct dns_header *header, size_t plen, char *name, char *keyname, int class);
 int dnssec_validate_reply(time_t now, struct dns_header *header, size_t plen, char *name, char *keyname, int *class, int *neganswer);

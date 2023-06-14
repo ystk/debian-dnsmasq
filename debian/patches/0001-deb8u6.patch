@@ -1,0 +1,1174 @@
+From: Simon Kelley <simon@thekelleys.org.uk>
+Date: Mon, 10 Apr 2023 09:42:25 +0000
+Subject: patch queue before 2.72-3+deb8u7~
+
+ dnsmasq (2.72-3+deb8u6) jessie-security; urgency=high
+ .
+   * Non-maintainer upload by the ELTS Security Team.
+   * CVE-2020-25681, CVE-2020-25682, CVE-2020-25683, CVE-2020-25687: a
+     heap-based buffer overflow was discovered in dnsmasq when DNSSEC is
+     enabled. All are fixed with the same patch.
+   * CVE-2020-25684: allows an off-path (non-MITM) attacker to attempt a
+     DNS Cache Poisoning attack. If chained with CVE-2020-25685 or
+     CVE-2020-25686, the attack complexity of a successful attack is
+     reduced. (CVE-2020-25685 and CVE-2020-25686 are not fixed in this
+     version, see security-tracker.debian.org.)
+Author: Sylvain Beucler <beuc@debian.org>
+Last-Update: 2023-03-27
+---
+ src/config.h       |   1 +
+ src/dnsmasq.c      |   7 +-
+ src/dnsmasq.h      |  15 +--
+ src/dnssec.c       | 280 ++++++++++++++++++++++++++++++++---------------------
+ src/forward.c      |  94 +++++++++++++-----
+ src/network.c      |   1 +
+ src/option.c       |  20 ++--
+ src/radv.c         |   3 +
+ src/rfc1035.c      |  88 +++++++++++------
+ src/rfc2131.c      |   4 +-
+ src/rfc3315.c      |  10 +-
+ src/tables.c       |   6 +-
+ src/util.c         |   9 +-
+ trust-anchors.conf |   3 +-
+ 14 files changed, 352 insertions(+), 189 deletions(-)
+
+diff --git a/src/config.h b/src/config.h
+index 145820a..c478536 100644
+--- a/src/config.h
++++ b/src/config.h
+@@ -18,6 +18,7 @@
+ #define MAX_PROCS 20 /* max no children for TCP requests */
+ #define CHILD_LIFETIME 150 /* secs 'till terminated (RFC1035 suggests > 120s) */
+ #define EDNS_PKTSZ 4096 /* default max EDNS.0 UDP packet from RFC5625 */
++#define SAFE_PKTSZ 1280 /* "go anywhere" UDP packet size */
+ #define KEYBLOCK_LEN 40 /* choose to mininise fragmentation when storing DNSSEC keys */
+ #define DNSSEC_WORK 50 /* Max number of queries to validate one question */
+ #define TIMEOUT 10 /* drop UDP queries after TIMEOUT seconds */
+diff --git a/src/dnsmasq.c b/src/dnsmasq.c
+index f4a89fc..4312a0f 100644
+--- a/src/dnsmasq.c
++++ b/src/dnsmasq.c
+@@ -93,8 +93,11 @@ int main (int argc, char **argv)
+     daemon->edns_pktsz = EDNS_PKTSZ;
+ #endif
+ 
+-  daemon->packet_buff_sz = daemon->edns_pktsz > DNSMASQ_PACKETSZ ? 
+-    daemon->edns_pktsz : DNSMASQ_PACKETSZ;
++  /* Min buffer size: we check after adding each record, so there must be 
++     memory for the largest packet, and the largest record so the
++     min for DNS is PACKETSZ+MAXDNAME+RRFIXEDSZ which is < 1000.
++     This might be increased is EDNS packet size if greater than the minimum. */ 
++  daemon->packet_buff_sz = daemon->edns_pktsz + MAXDNAME + RRFIXEDSZ;
+   daemon->packet = safe_malloc(daemon->packet_buff_sz);
+   
+   daemon->addrbuff = safe_malloc(ADDRSTRLEN);
+diff --git a/src/dnsmasq.h b/src/dnsmasq.h
+index e74b15a..9456e9f 100644
+--- a/src/dnsmasq.h
++++ b/src/dnsmasq.h
+@@ -177,13 +177,6 @@ struct event_desc {
+ #define EC_MISC        5
+ #define EC_INIT_OFFSET 10
+ 
+-/* Min buffer size: we check after adding each record, so there must be 
+-   memory for the largest packet, and the largest record so the
+-   min for DNS is PACKETSZ+MAXDNAME+RRFIXEDSZ which is < 1000.
+-   This might be increased is EDNS packet size if greater than the minimum.
+-*/
+-#define DNSMASQ_PACKETSZ PACKETSZ+MAXDNAME+RRFIXEDSZ
+-
+ /* Trust the compiler dead-code eliminator.... */
+ #define option_bool(x) (((x) < 32) ? daemon->options & (1u << (x)) : daemon->options2 & (1u << ((x) - 32)))
+ 
+@@ -499,7 +492,7 @@ struct server {
+   char interface[IF_NAMESIZE+1];
+   struct serverfd *sfd; 
+   char *domain; /* set if this server only handles a domain. */ 
+-  int flags, tcpfd;
++  int flags, tcpfd, edns_pktsz;
+   unsigned int queries, failed_queries;
+ #ifdef HAVE_LOOP
+   u32 uid;
+@@ -576,6 +569,8 @@ struct hostsfile {
+ #define FREC_DO_QUESTION       64
+ #define FREC_ADDED_PHEADER    128
+ #define FREC_CHECK_NOSIGN     256
++#define FREC_TEST_PKTSZ       512
++#define FREC_HAS_EXTRADATA    512        
+ 
+ #ifdef HAVE_DNSSEC
+ #define HASH_SIZE 20 /* SHA-1 digest size */
+@@ -1117,7 +1112,7 @@ int in_zone(struct auth_zone *zone, char *name, char **cut);
+ #endif
+ 
+ /* dnssec.c */
+-size_t dnssec_generate_query(struct dns_header *header, char *end, char *name, int class, int type, union mysockaddr *addr);
++size_t dnssec_generate_query(struct dns_header *header, char *end, char *name, int class, int type, union mysockaddr *addr, int edns_pktsz);
+ int dnssec_validate_by_ds(time_t now, struct dns_header *header, size_t n, char *name, char *keyname, int class);
+ int dnssec_validate_ds(time_t now, struct dns_header *header, size_t plen, char *name, char *keyname, int class);
+ int dnssec_validate_reply(time_t now, struct dns_header *header, size_t plen, char *name, char *keyname, int *class, int *neganswer);
+@@ -1133,7 +1128,7 @@ u32 rand32(void);
+ u64 rand64(void);
+ int legal_hostname(char *c);
+ char *canonicalise(char *s, int *nomem);
+-unsigned char *do_rfc1035_name(unsigned char *p, char *sval);
++unsigned char *do_rfc1035_name(unsigned char *p, char *sval, char *limit);
+ void *safe_malloc(size_t size);
+ void safe_pipe(int *fd, int read_noblock);
+ void *whine_malloc(size_t size);
+diff --git a/src/dnssec.c b/src/dnssec.c
+index 69bfc29..17356df 100644
+--- a/src/dnssec.c
++++ b/src/dnssec.c
+@@ -73,7 +73,7 @@ static char *algo_digest_name(int algo)
+ }
+       
+ /* Find pointer to correct hash function in nettle library */
+-static const struct nettle_hash *hash_find(char *name)
++const struct nettle_hash *hash_find(char *name)
+ {
+   int i;
+   
+@@ -90,7 +90,7 @@ static const struct nettle_hash *hash_find(char *name)
+ }
+ 
+ /* expand ctx and digest memory allocations if necessary and init hash function */
+-static int hash_init(const struct nettle_hash *hash, void **ctxp, unsigned char **digestp)
++int hash_init(const struct nettle_hash *hash, void **ctxp, unsigned char **digestp)
+ {
+   static void *ctx = NULL;
+   static unsigned char *digest = NULL;
+@@ -454,35 +454,81 @@ static u16 *get_desc(int type)
+   return p+1;
+ }
+ 
+-/* Return bytes of canonicalised rdata, when the return value is zero, the remaining 
+-   data, pointed to by *p, should be used raw. */
+-static int get_rdata(struct dns_header *header, size_t plen, unsigned char *end, char *buff, 
+-		     unsigned char **p, u16 **desc)
++/* Return bytes of canonicalised rrdata one by one.
++   Init state->ip with the RR, and state->end with the end of same.
++   Init state->op to NULL.
++   Init state->desc to RR descriptor.
++   Init state->buff with a MAXDNAME * 2 buffer.
++   
++   After each call which returns 1, state->op points to the next byte of data.
++   On returning 0, the end has been reached.
++*/
++struct rdata_state {
++  u16 *desc;
++  size_t c;
++  unsigned char *end, *ip, *op;
++  char *buff;
++};
++
++static int get_rdata(struct dns_header *header, size_t plen, struct rdata_state *state)
+ {
+-  int d = **desc;
+-  
+-  (*desc)++;
+-  
+-  /* No more data needs mangling */
+-  if (d == (u16)-1)
+-    return 0;
++  int d;
+   
+-  if (d == 0 && extract_name(header, plen, p, buff, 1, 0))
+-    /* domain-name, canonicalise */
+-    return to_wire(buff);
+-  else
+-    { 
+-      /* plain data preceding a domain-name, don't run off the end of the data */
+-      if ((end - *p) < d)
+-	d = end - *p;
++  if (state->op && state->c != 1)
++    {
++      state->op++;
++      state->c--;
++      return 1;
++    }
++ 
++
++  while (1)
++    {
++      d = *(state->desc);
+       
+-      if (d != 0)
++      if (d == (u16)-1)
+ 	{
+-	  memcpy(buff, *p, d);
+-	  *p += d;
++	  /* all the bytes to the end. */
++	  if ((state->c = state->end - state->ip) != 0)
++	    {
++	      state->op = state->ip;
++	      state->ip = state->end;;
++	    }
++	  else
++	    return 0;
++	}
++      else
++	{
++	  state->desc++;
++	  
++	  if (d == (u16)0)
++	    {
++	      /* domain-name, canonicalise */
++	      int len;
++	      
++	      if (!extract_name(header, plen, &state->ip, state->buff, 1, 0) ||
++		  (len = to_wire(state->buff)) == 0)
++		continue;
++	      
++	      state->c = len;
++	      state->op = (unsigned char *)state->buff;
++	    }
++	  else
++	    {
++	      /* plain data preceding a domain-name, don't run off the end of the data */
++	      if ((state->end - state->ip) < d)
++		d = state->end - state->ip;
++	      
++	      if (d == 0)
++		continue;
++		  
++	      state->op = state->ip;
++	      state->c = d;
++	      state->ip += d;
++	    }
+ 	}
+       
+-      return d;
++      return 1;
+     }
+ }
+ 
+@@ -514,90 +560,75 @@ static int expand_workspace(unsigned char ***wkspc, int *sz, int new)
+   return 1;
+ }
+ 
+-/* Bubble sort the RRset into the canonical order. 
+-   Note that the byte-streams from two RRs may get unsynced: consider 
+-   RRs which have two domain-names at the start and then other data.
+-   The domain-names may have different lengths in each RR, but sort equal
+-
+-   ------------
+-   |abcde|fghi|
+-   ------------
+-   |abcd|efghi|
+-   ------------
++/* Bubble sort the RRset into the canonical order. */
+ 
+-   leaving the following bytes as deciding the order. Hence the nasty left1 and left2 variables.
+-*/
+-
+-static void sort_rrset(struct dns_header *header, size_t plen, u16 *rr_desc, int rrsetidx, 
+-		       unsigned char **rrset, char *buff1, char *buff2)
++static int sort_rrset(struct dns_header *header, size_t plen, u16 *rr_desc, int rrsetidx, 
++		      unsigned char **rrset, char *buff1, char *buff2)
+ {
+-  int swap, quit, i;
++  int swap, i, j;
+   
+   do
+     {
+       for (swap = 0, i = 0; i < rrsetidx-1; i++)
+ 	{
+-	  int rdlen1, rdlen2, left1, left2, len1, len2, len, rc;
+-	  u16 *dp1, *dp2;
+-	  unsigned char *end1, *end2;
++	  int rdlen1, rdlen2;
++	  struct rdata_state state1, state2;
++	  
+ 	  /* Note that these have been determined to be OK previously,
+ 	     so we don't need to check for NULL return here. */
+-	  unsigned char *p1 = skip_name(rrset[i], header, plen, 10);
+-	  unsigned char *p2 = skip_name(rrset[i+1], header, plen, 10);
+-	  
+-	  p1 += 8; /* skip class, type, ttl */
+-	  GETSHORT(rdlen1, p1);
+-	  end1 = p1 + rdlen1;
++	  state1.ip = skip_name(rrset[i], header, plen, 10);
++	  state2.ip = skip_name(rrset[i+1], header, plen, 10);
++	  state1.op = state2.op = NULL;
++	  state1.buff = buff1;
++	  state2.buff = buff2;
++	  state1.desc = state2.desc = rr_desc;
+ 	  
+-	  p2 += 8; /* skip class, type, ttl */
+-	  GETSHORT(rdlen2, p2);
+-	  end2 = p2 + rdlen2; 
++	  state1.ip += 8; /* skip class, type, ttl */
++	  GETSHORT(rdlen1, state1.ip);
++	  if (!CHECK_LEN(header, state1.ip, plen, rdlen1))
++	    return rrsetidx; /* short packet */
++	  state1.end = state1.ip + rdlen1;
+ 	  
+-	  dp1 = dp2 = rr_desc;
+-	  
+-	  for (quit = 0, left1 = 0, left2 = 0, len1 = 0, len2 = 0; !quit;)
++	  state2.ip += 8; /* skip class, type, ttl */
++	  GETSHORT(rdlen2, state2.ip);
++	  if (!CHECK_LEN(header, state2.ip, plen, rdlen2))
++	    return rrsetidx; /* short packet */
++	  state2.end = state2.ip + rdlen2; 
++	  	  
++	  while (1)
+ 	    {
+-	      if (left1 != 0)
+-		memmove(buff1, buff1 + len1 - left1, left1);
+-	      
+-	      if ((len1 = get_rdata(header, plen, end1, buff1 + left1, &p1, &dp1)) == 0)
+-		{
+-		  quit = 1;
+-		  len1 = end1 - p1;
+-		  memcpy(buff1 + left1, p1, len1);
+-		}
+-	      len1 += left1;
++	      int ok1, ok2;
+ 	      
+-	      if (left2 != 0)
+-		memmove(buff2, buff2 + len2 - left2, left2);
+-	      
+-	      if ((len2 = get_rdata(header, plen, end2, buff2 + left2, &p2, &dp2)) == 0)
++	      ok1 = get_rdata(header, plen, &state1);
++	      ok2 = get_rdata(header, plen, &state2);
++
++	      if (!ok1 && !ok2)
+ 		{
+-		  quit = 1;
+-		  len2 = end2 - p2;
+-		  memcpy(buff2 + left2, p2, len2);
++		  /* Two RRs are equal, remove one copy. RFC 4034, para 6.3 */
++		  for (j = i+1; j < rrsetidx-1; j++)
++		    rrset[j] = rrset[j+1];
++		  rrsetidx--;
++		  i--;
++		  break;
+ 		}
+-	      len2 += left2;
+-	       
+-	      if (len1 > len2)
+-		left1 = len1 - len2, left2 = 0, len = len2;
+-	      else
+-		left2 = len2 - len1, left1 = 0, len = len1;
+-	      
+-	      rc = (len == 0) ? 0 : memcmp(buff1, buff2, len);
+-	      
+-	      if (rc > 0 || (rc == 0 && quit && len1 > len2))
++	      else if (ok1 && (!ok2 || *state1.op > *state2.op)) 
+ 		{
+ 		  unsigned char *tmp = rrset[i+1];
+ 		  rrset[i+1] = rrset[i];
+ 		  rrset[i] = tmp;
+-		  swap = quit = 1;
++		  swap = 1;
++		  break;
+ 		}
+-	      else if (rc < 0)
+-		quit = 1;
++	      else if (ok2 && (!ok1 || *state2.op > *state1.op))
++		break;
++	      
++	      /* arrive here when bytes are equal, go round the loop again
++		 and compare the next ones. */
+ 	    }
+ 	}
+     } while (swap);
++
++  return rrsetidx;
+ }
+ 
+ /* Validate a single RRset (class, type, name) in the supplied DNS reply 
+@@ -698,7 +729,7 @@ static int validate_rrset(time_t now, struct dns_header *header, size_t plen, in
+   /* Sort RRset records into canonical order. 
+      Note that at this point keyname and daemon->workspacename buffs are
+      unused, and used as workspace by the sort. */
+-  sort_rrset(header, plen, rr_desc, rrsetidx, rrset, daemon->workspacename, keyname);
++  rrsetidx = sort_rrset(header, plen, rr_desc, rrsetidx, rrset, daemon->workspacename, keyname);
+          
+   /* Now try all the sigs to try and find one which validates */
+   for (j = 0; j <sigidx; j++)
+@@ -769,14 +800,18 @@ static int validate_rrset(time_t now, struct dns_header *header, size_t plen, in
+       wire_len = to_wire(keyname);
+       hash->update(ctx, (unsigned int)wire_len, (unsigned char*)keyname);
+       from_wire(keyname);
++
++#define RRBUFLEN 300 /* Most RRs are smaller than this. */
+       
+       for (i = 0; i < rrsetidx; ++i)
+ 	{
+-	  int seg;
+-	  unsigned char *end, *cp;
+-	  u16 len, *dp;
++	  int j;
++	  struct rdata_state state;
++	  u16 len;
++	  unsigned char rrbuf[RRBUFLEN];
+ 	  
+ 	  p = rrset[i];
++	  
+ 	  if (!extract_name(header, plen, &p, name, 1, 10)) 
+ 	    return STAT_BOGUS;
+ 
+@@ -785,8 +820,7 @@ static int validate_rrset(time_t now, struct dns_header *header, size_t plen, in
+ 	  /* if more labels than in RRsig name, hash *.<no labels in rrsig labels field>  4035 5.3.2 */
+ 	  if (labels < name_labels)
+ 	    {
+-	      int k;
+-	      for (k = name_labels - labels; k != 0; k--)
++	      for (j = name_labels - labels; j != 0; j--)
+ 		while (*name_start != '.' && *name_start != 0)
+ 		  name_start++;
+ 	      name_start--;
+@@ -803,23 +837,44 @@ static int validate_rrset(time_t now, struct dns_header *header, size_t plen, in
+ 	  if (!CHECK_LEN(header, p, plen, rdlen))
+ 	    return STAT_BOGUS; 
+ 	  
+-	  end = p + rdlen;
++	  /* canonicalise rdata and calculate length of same, use 
++	     name buffer as workspace for get_rdata. */
++	  state.ip = p;
++	  state.op = NULL;
++	  state.desc = rr_desc;
++	  state.buff = name;
++	  state.end = p + rdlen;
+ 	  
+-	  /* canonicalise rdata and calculate length of same, use name buffer as workspace */
+-	  cp = p;
+-	  dp = rr_desc;
+-	  for (len = 0; (seg = get_rdata(header, plen, end, name, &cp, &dp)) != 0; len += seg);
+-	  len += end - cp;
+-	  len = htons(len);
++	  for (j = 0; get_rdata(header, plen, &state); j++)
++	    if (j < RRBUFLEN)
++	      rrbuf[j] = *state.op;
++
++	  len = htons((u16)j);
+ 	  hash->update(ctx, 2, (unsigned char *)&len); 
++
++	  /* If the RR is shorter than RRBUFLEN (most of them, in practice)
++	     then we can just digest it now. If it exceeds RRBUFLEN we have to
++	     go back to the start and do it in chunks. */
++	  if (j >= RRBUFLEN)
++	    {
++	      state.ip = p;
++	      state.op = NULL;
++	      state.desc = rr_desc;
++
++	      for (j = 0; get_rdata(header, plen, &state); j++)
++		{
++		   rrbuf[j] = *state.op;
++
++		   if (j == RRBUFLEN - 1)
++		     {
++		       hash->update(ctx, RRBUFLEN, rrbuf);
++		       j = -1;
++		     }
++		}
++	    }
+ 	  
+-	  /* Now canonicalise again and digest. */
+-	  cp = p;
+-	  dp = rr_desc;
+-	  while ((seg = get_rdata(header, plen, end, name, &cp, &dp)))
+-	    hash->update(ctx, seg, (unsigned char *)name);
+-	  if (cp != end)
+-	    hash->update(ctx, end - cp, cp);
++	  if (j != 0)
++	    hash->update(ctx, j, rrbuf);
+ 	}
+      
+       hash->digest(ctx, hash->digest_size, digest);
+@@ -2014,10 +2069,12 @@ int dnskey_keytag(int alg, int flags, unsigned char *key, int keylen)
+     }
+ }
+ 
+-size_t dnssec_generate_query(struct dns_header *header, char *end, char *name, int class, int type, union mysockaddr *addr)
++size_t dnssec_generate_query(struct dns_header *header, char *end, char *name, int class, 
++			     int type, union mysockaddr *addr, int edns_pktsz)
+ {
+   unsigned char *p;
+   char *types = querystr("dnssec-query", type);
++  size_t ret;
+ 
+   if (addr->sa.sa_family == AF_INET) 
+     log_query(F_DNSSEC | F_IPV4, name, (struct all_addr *)&addr->in.sin_addr, types);
+@@ -2041,12 +2098,17 @@ size_t dnssec_generate_query(struct dns_header *header, char *end, char *name, i
+ 
+   p = (unsigned char *)(header+1);
+ 	
+-  p = do_rfc1035_name(p, name);
++  p = do_rfc1035_name(p, name, NULL);
+   *p++ = 0;
+   PUTSHORT(type, p);
+   PUTSHORT(class, p);
+ 
+-  return add_do_bit(header, p - (unsigned char *)header, end);
++  ret = add_do_bit(header, p - (unsigned char *)header, end);
++
++  if (find_pseudoheader(header, ret, NULL, &p, NULL))
++    PUTSHORT(edns_pktsz, p);
++
++  return ret;
+ }
+ 
+ /* Go through a domain name, find "pointers" and fix them up based on how many bytes
+diff --git a/src/forward.c b/src/forward.c
+index 4895efe..c4e0dc1 100644
+--- a/src/forward.c
++++ b/src/forward.c
+@@ -16,7 +16,7 @@
+ 
+ #include "dnsmasq.h"
+ 
+-static struct frec *lookup_frec(unsigned short id, void *hash);
++static struct frec *lookup_frec(unsigned short id, int fd, int family, void *hash);
+ static struct frec *lookup_frec_by_sender(unsigned short id,
+ 					  union mysockaddr *addr,
+ 					  void *hash);
+@@ -256,6 +256,7 @@ static int forward_query(int udpfd, union mysockaddr *udpaddr,
+   void *hash = &crc;
+ #endif
+  unsigned int gotname = extract_request(header, plen, daemon->namebuff, NULL);
++ unsigned char *pheader;
+ 
+  (void)do_bit;
+ 
+@@ -264,19 +265,32 @@ static int forward_query(int udpfd, union mysockaddr *udpaddr,
+     forward = NULL;
+   else if (forward || (hash && (forward = lookup_frec_by_sender(ntohs(header->id), udpaddr, hash))))
+     {
++      /* If we didn't get an answer advertising a maximal packet in EDNS,
++	 fall back to 1280, which should work everywhere on IPv6.
++	 If that generates an answer, it will become the new default
++	 for this server */
++      forward->flags |= FREC_TEST_PKTSZ;
++      
+ #ifdef HAVE_DNSSEC
+       /* If we've already got an answer to this query, but we're awaiting keys for validation,
+ 	 there's no point retrying the query, retry the key query instead...... */
+       if (forward->blocking_query)
+ 	{
+ 	  int fd;
+-
++	  
++	  forward->flags &= ~FREC_TEST_PKTSZ;
++	  
+ 	  while (forward->blocking_query)
+ 	    forward = forward->blocking_query;
++	   
++	  forward->flags |= FREC_TEST_PKTSZ;
+ 	  
+ 	  blockdata_retrieve(forward->stash, forward->stash_len, (void *)header);
+ 	  plen = forward->stash_len;
+ 	  
++	  if (find_pseudoheader(header, plen, NULL, &pheader, NULL))
++	    PUTSHORT((forward->flags & FREC_TEST_PKTSZ) ? SAFE_PKTSZ : forward->sentto->edns_pktsz, pheader);
++
+ 	  if (forward->sentto->addr.sa.sa_family == AF_INET) 
+ 	    log_query(F_DNSSEC | F_IPV4, "retry", (struct all_addr *)&forward->sentto->addr.in.sin_addr, "dnssec");
+ #ifdef HAVE_IPV6
+@@ -387,13 +401,14 @@ static int forward_query(int udpfd, union mysockaddr *udpaddr,
+     {
+       struct server *firstsentto = start;
+       int forwarded = 0;
+-      
++      size_t edns0_len;
++
+       if (option_bool(OPT_ADD_MAC))
+-	plen = add_mac(header, plen, ((char *) header) + daemon->packet_buff_sz, &forward->source);
++        plen = add_mac(header, plen, ((char *) header) + PACKETSZ, &forward->source);
+       
+       if (option_bool(OPT_CLIENT_SUBNET))
+ 	{
+-	  size_t new = add_source_addr(header, plen, ((char *) header) + daemon->packet_buff_sz, &forward->source); 
++	  size_t new = add_source_addr(header, plen, ((char *) header) + PACKETSZ, &forward->source); 
+ 	  if (new != plen)
+ 	    {
+ 	      plen = new;
+@@ -404,7 +419,7 @@ static int forward_query(int udpfd, union mysockaddr *udpaddr,
+ #ifdef HAVE_DNSSEC
+       if (option_bool(OPT_DNSSEC_VALID))
+ 	{
+-	  size_t new_plen = add_do_bit(header, plen, ((char *) header) + daemon->packet_buff_sz);
++	  size_t new_plen = add_do_bit(header, plen, ((char *) header) + PACKETSZ);
+ 	 
+ 	  /* For debugging, set Checking Disabled, otherwise, have the upstream check too,
+ 	     this allows it to select auth servers when one is returning bad data. */
+@@ -418,6 +433,10 @@ static int forward_query(int udpfd, union mysockaddr *udpaddr,
+ 	}
+ #endif
+ 
++      /* If we're sending an EDNS0 with any options, we can't recreate the query from a reply. */
++      if (find_pseudoheader(header, plen, &edns0_len, NULL, NULL) && edns0_len > 11)
++	forward->flags |= FREC_HAS_EXTRADATA;
++
+       while (1)
+ 	{ 
+ 	  /* only send to servers dealing with our domain.
+@@ -464,6 +483,9 @@ static int forward_query(int udpfd, union mysockaddr *udpaddr,
+ 		    }
+ #endif
+ 		}
++
++	      if (find_pseudoheader(header, plen, NULL, &pheader, NULL))
++		PUTSHORT((forward->flags & FREC_TEST_PKTSZ) ? SAFE_PKTSZ : start->edns_pktsz, pheader);
+ 	      
+ 	      if (sendto(fd, (char *)header, plen, 0,
+ 			 &start->addr.sa,
+@@ -721,12 +743,15 @@ void reply_query(int fd, int family, time_t now)
+   crc = questions_crc(header, n, daemon->namebuff);
+ #endif
+   
+-  if (!(forward = lookup_frec(ntohs(header->id), hash)))
++  if (!(forward = lookup_frec(ntohs(header->id), fd, family, hash)))
+     return;
+   
++  /* Note: if we send extra options in the EDNS0 header, we can't recreate
++     the query from the reply. */
+   if ((RCODE(header) == SERVFAIL || RCODE(header) == REFUSED) &&
+       !option_bool(OPT_ORDER) &&
+-      forward->forwardall == 0)
++      forward->forwardall == 0 &&
++      !(forward->flags & FREC_HAS_EXTRADATA))
+     /* for broken servers, attempt to send to another one. */
+     {
+       unsigned char *pheader;
+@@ -750,7 +775,6 @@ void reply_query(int fd, int family, time_t now)
+     }   
+    
+   server = forward->sentto;
+-  
+   if ((forward->sentto->flags & SERV_TYPE) == 0)
+     {
+       if (RCODE(header) == REFUSED)
+@@ -771,7 +795,12 @@ void reply_query(int fd, int family, time_t now)
+       if (!option_bool(OPT_ALL_SERVERS))
+ 	daemon->last_server = server;
+     }
+-
++ 
++  /* We tried resending to this server with a smaller maximum size and got an answer.
++     Make that permanent. */
++  if (server && (forward->flags & FREC_TEST_PKTSZ))
++    server->edns_pktsz = SAFE_PKTSZ;
++  
+   /* If the answer is an error, keep the forward record in place in case
+      we get a good reply from another server. Kill it when we've
+      had replies from all to avoid filling the forwarding table when
+@@ -868,8 +897,8 @@ void reply_query(int fd, int family, time_t now)
+ 		  if (status == STAT_NEED_KEY)
+ 		    {
+ 		      new->flags |= FREC_DNSKEY_QUERY; 
+-		      nn = dnssec_generate_query(header, ((char *) header) + daemon->packet_buff_sz,
+-						 daemon->keyname, forward->class, T_DNSKEY, &server->addr);
++		      nn = dnssec_generate_query(header, ((char *) header) + server->edns_pktsz,
++						 daemon->keyname, forward->class, T_DNSKEY, &server->addr, server->edns_pktsz);
+ 		    }
+ 		  else 
+ 		    {
+@@ -877,8 +906,8 @@ void reply_query(int fd, int family, time_t now)
+ 			new->flags |= FREC_CHECK_NOSIGN;
+ 		      else
+ 			new->flags |= FREC_DS_QUERY;
+-		      nn = dnssec_generate_query(header,((char *) header) + daemon->packet_buff_sz,
+-						 daemon->keyname, forward->class, T_DS, &server->addr);
++		      nn = dnssec_generate_query(header,((char *) header) + server->edns_pktsz,
++						 daemon->keyname, forward->class, T_DS, &server->addr, server->edns_pktsz);
+ 		    }
+ 		  if ((hash = hash_questions(header, nn, daemon->namebuff)))
+ 		    memcpy(new->hash, hash, HASH_SIZE);
+@@ -1439,7 +1468,7 @@ static int  tcp_check_for_unsigned_zone(time_t now, struct dns_header *header, s
+ 	  return STAT_BOGUS;
+ 	}
+ 
+-      m = dnssec_generate_query(header, ((char *) header) + 65536, name_start, class, T_DS, &server->addr);
++      m = dnssec_generate_query(header, ((char *) header) + 65536, name_start, class, T_DS, &server->addr, server->edns_pktsz);
+       
+       /* We rely on the question section coming back unchanged, ensure it is with the hash. */
+       if ((newhash = hash_questions(header, (unsigned int)m, name)))
+@@ -1546,7 +1575,7 @@ static int tcp_key_recurse(time_t now, int status, struct dns_header *header, si
+ 
+     another_tcp_key:
+       m = dnssec_generate_query(new_header, ((char *) new_header) + 65536, keyname, class, 
+-				new_status == STAT_NEED_KEY ? T_DNSKEY : T_DS, &server->addr);
++				new_status == STAT_NEED_KEY ? T_DNSKEY : T_DS, &server->addr, server->edns_pktsz);
+       
+       *length = htons(m);
+       
+@@ -2112,14 +2141,25 @@ struct frec *get_new_frec(time_t now, int *wait, int force)
+ }
+  
+ /* crc is all-ones if not known. */
+-static struct frec *lookup_frec(unsigned short id, void *hash)
++static struct frec *lookup_frec(unsigned short id, int fd, int family, void *hash)
+ {
+   struct frec *f;
+ 
+   for(f = daemon->frec_list; f; f = f->next)
+     if (f->sentto && f->new_id == id && 
+ 	(!hash || memcmp(hash, f->hash, HASH_SIZE) == 0))
+-      return f;
++      {
++	/* sent from random port */
++	if (family == AF_INET && f->rfd4 && f->rfd4->fd == fd)
++	  return f;
++
++	if (family == AF_INET6 && f->rfd6 && f->rfd6->fd == fd)
++	  return f;
++
++	/* sent to upstream from bound socket. */
++	if (f->sentto->sfd && f->sentto->sfd->fd == fd)
++	  return f;
++      }
+       
+   return NULL;
+ }
+@@ -2179,12 +2219,20 @@ void server_gone(struct server *server)
+ static unsigned short get_id(void)
+ {
+   unsigned short ret = 0;
++  struct frec *f;
+   
+-  do 
+-    ret = rand16();
+-  while (lookup_frec(ret, NULL));
+-  
+-  return ret;
++  while (1)
++    {
++      ret = rand16();
++
++      /* ensure id is unique. */
++      for (f = daemon->frec_list; f; f = f->next)
++	if (f->sentto && f->new_id == ret)
++	  break;
++
++      if (!f)
++	return ret;
++    }
+ }
+ 
+ 
+diff --git a/src/network.c b/src/network.c
+index 5067007..72f0a85 100644
+--- a/src/network.c
++++ b/src/network.c
+@@ -1396,6 +1396,7 @@ void add_update_server(int flags,
+       serv->domain = domain_str;
+       serv->next = next;
+       serv->queries = serv->failed_queries = 0;
++      serv->edns_pktsz = daemon->edns_pktsz;
+ #ifdef HAVE_LOOP
+       serv->uid = rand32();
+ #endif      
+diff --git a/src/option.c b/src/option.c
+index 45d8875..4eb145b 100644
+--- a/src/option.c
++++ b/src/option.c
+@@ -1326,7 +1326,7 @@ static int parse_dhcp_opt(char *errstr, char *arg, int flags)
+ 		    }
+ 		  
+ 		  p = newp;
+-		  end = do_rfc1035_name(p + len, dom);
++		  end = do_rfc1035_name(p + len, dom, NULL);
+ 		  *end++ = 0;
+ 		  len = end - p;
+ 		  free(dom);
+@@ -4394,15 +4394,19 @@ void read_opts(int argc, char **argv, char *compile_opts)
+     {
+       struct server *tmp;
+       for (tmp = daemon->servers; tmp; tmp = tmp->next)
+-	if (!(tmp->flags & SERV_HAS_SOURCE))
+-	  {
+-	    if (tmp->source_addr.sa.sa_family == AF_INET)
+-	      tmp->source_addr.in.sin_port = htons(daemon->query_port);
++	{
++	  tmp->edns_pktsz = daemon->edns_pktsz;
++	 
++	  if (!(tmp->flags & SERV_HAS_SOURCE))
++	    {
++	      if (tmp->source_addr.sa.sa_family == AF_INET)
++		tmp->source_addr.in.sin_port = htons(daemon->query_port);
+ #ifdef HAVE_IPV6
+-	    else if (tmp->source_addr.sa.sa_family == AF_INET6)
+-	      tmp->source_addr.in6.sin6_port = htons(daemon->query_port);
++	      else if (tmp->source_addr.sa.sa_family == AF_INET6)
++		tmp->source_addr.in6.sin6_port = htons(daemon->query_port);
+ #endif 
+-	  } 
++	    }
++	} 
+     }
+   
+   if (daemon->if_addrs)
+diff --git a/src/radv.c b/src/radv.c
+index 3c8b162..923c1c3 100644
+--- a/src/radv.c
++++ b/src/radv.c
+@@ -185,6 +185,9 @@ void icmp6_packet(time_t now)
+       /* look for link-layer address option for logging */
+       if (sz >= 16 && packet[8] == ICMP6_OPT_SOURCE_MAC && (packet[9] * 8) + 8 <= sz)
+ 	{
++	  if ((packet[9] * 8 - 2) * 3 - 1 >= MAXDNAME) {
++	    return;
++	  }
+ 	  print_mac(daemon->namebuff, &packet[10], (packet[9] * 8) - 2);
+ 	  mac = daemon->namebuff;
+ 	}
+diff --git a/src/rfc1035.c b/src/rfc1035.c
+index 8a7d260..871212a 100644
+--- a/src/rfc1035.c
++++ b/src/rfc1035.c
+@@ -527,7 +527,7 @@ static size_t add_pseudoheader(struct dns_header *header, size_t plen, unsigned
+ 	return plen;
+       *p++ = 0; /* empty name */
+       PUTSHORT(T_OPT, p);
+-      PUTSHORT(daemon->edns_pktsz, p); /* max packet length */
++      PUTSHORT(SAFE_PKTSZ, p); /* max packet length, this will be overwritten */
+       PUTSHORT(0, p);    /* extended RCODE and version */
+       PUTSHORT(set_do ? 0x8000 : 0, p); /* DO flag */
+       lenp = p;
+@@ -1198,7 +1198,10 @@ unsigned int extract_request(struct dns_header *header, size_t qlen, char *name,
+ size_t setup_reply(struct dns_header *header, size_t qlen,
+ 		struct all_addr *addrp, unsigned int flags, unsigned long ttl)
+ {
+-  unsigned char *p = skip_questions(header, qlen);
++  unsigned char *p;
++
++  if (!(p = skip_questions(header, qlen)))
++    return 0;
+   
+   /* clear authoritative and truncated flags, set QR flag */
+   header->hb3 = (header->hb3 & ~(HB3_AA | HB3_TC)) | HB3_QR;
+@@ -1214,7 +1217,7 @@ size_t setup_reply(struct dns_header *header, size_t qlen,
+     SET_RCODE(header, NOERROR); /* empty domain */
+   else if (flags == F_NXDOMAIN)
+     SET_RCODE(header, NXDOMAIN);
+-  else if (p && flags == F_IPV4)
++  else if (flags == F_IPV4)
+     { /* we know the address */
+       SET_RCODE(header, NOERROR);
+       header->ancount = htons(1);
+@@ -1222,7 +1225,7 @@ size_t setup_reply(struct dns_header *header, size_t qlen,
+       add_resource_record(header, NULL, NULL, sizeof(struct dns_header), &p, ttl, NULL, T_A, C_IN, "4", addrp);
+     }
+ #ifdef HAVE_IPV6
+-  else if (p && flags == F_IPV6)
++  else if (flags == F_IPV6)
+     {
+       SET_RCODE(header, NOERROR);
+       header->ancount = htons(1);
+@@ -1328,6 +1331,7 @@ int check_for_bogus_wildcard(struct dns_header *header, size_t qlen, char *name,
+   return 0;
+ }
+ 
++
+ int add_resource_record(struct dns_header *header, char *limit, int *truncp, int nameoffset, unsigned char **pp, 
+ 			unsigned long ttl, int *offset, unsigned short type, unsigned short class, char *format, ...)
+ {
+@@ -1337,29 +1341,47 @@ int add_resource_record(struct dns_header *header, char *limit, int *truncp, int
+   unsigned short usval;
+   long lval;
+   char *sval;
++#define CHECK_LIMIT(size) \
++  if (limit && p + (size) > (unsigned char*)limit) \
++    { \
++      va_end(ap); \
++      goto truncated; \
++    }
+ 
+   if (truncp && *truncp)
+     return 0;
+- 
++
+   va_start(ap, format);   /* make ap point to 1st unamed argument */
+-  
++
+   if (nameoffset > 0)
+     {
++      CHECK_LIMIT(2);
+       PUTSHORT(nameoffset | 0xc000, p);
+     }
+   else
+     {
+       char *name = va_arg(ap, char *);
+-      if (name)
+-	p = do_rfc1035_name(p, name);
++      if (name && !(p = do_rfc1035_name(p, name, limit)))
++	{
++	  va_end(ap);
++	  goto truncated;
++	}
++      
+       if (nameoffset < 0)
+ 	{
++	  CHECK_LIMIT(2);
+ 	  PUTSHORT(-nameoffset | 0xc000, p);
+ 	}
+       else
+-	*p++ = 0;
++	{
++	  CHECK_LIMIT(1);
++	  *p++ = 0;
++	}
+     }
+ 
++  /* type (2) + class (2) + ttl (4) + rdlen (2) */
++  CHECK_LIMIT(10);
++  
+   PUTSHORT(type, p);
+   PUTSHORT(class, p);
+   PUTLONG(ttl, p);      /* TTL */
+@@ -1372,6 +1394,7 @@ int add_resource_record(struct dns_header *header, char *limit, int *truncp, int
+       {
+ #ifdef HAVE_IPV6
+       case '6':
++        CHECK_LIMIT(IN6ADDRSZ);
+ 	sval = va_arg(ap, char *); 
+ 	memcpy(p, sval, IN6ADDRSZ);
+ 	p += IN6ADDRSZ;
+@@ -1379,36 +1402,47 @@ int add_resource_record(struct dns_header *header, char *limit, int *truncp, int
+ #endif
+ 	
+       case '4':
++        CHECK_LIMIT(INADDRSZ);
+ 	sval = va_arg(ap, char *); 
+ 	memcpy(p, sval, INADDRSZ);
+ 	p += INADDRSZ;
+ 	break;
+ 	
+       case 'b':
++        CHECK_LIMIT(1);
+ 	usval = va_arg(ap, int);
+ 	*p++ = usval;
+ 	break;
+ 	
+       case 's':
++        CHECK_LIMIT(2);
+ 	usval = va_arg(ap, int);
+ 	PUTSHORT(usval, p);
+ 	break;
+ 	
+       case 'l':
++        CHECK_LIMIT(4);
+ 	lval = va_arg(ap, long);
+ 	PUTLONG(lval, p);
+ 	break;
+ 	
+       case 'd':
+-	/* get domain-name answer arg and store it in RDATA field */
+-	if (offset)
+-	  *offset = p - (unsigned char *)header;
+-	p = do_rfc1035_name(p, va_arg(ap, char *));
+-	*p++ = 0;
++        /* get domain-name answer arg and store it in RDATA field */
++        if (offset)
++          *offset = p - (unsigned char *)header;
++        p = do_rfc1035_name(p, va_arg(ap, char *), limit);
++        if (!p)
++          {
++            va_end(ap);
++            goto truncated;
++          }
++        CHECK_LIMIT(1);
++        *p++ = 0;
+ 	break;
+ 	
+       case 't':
+ 	usval = va_arg(ap, int);
++        CHECK_LIMIT(usval);
+ 	sval = va_arg(ap, char *);
+ 	if (usval != 0)
+ 	  memcpy(p, sval, usval);
+@@ -1420,20 +1454,24 @@ int add_resource_record(struct dns_header *header, char *limit, int *truncp, int
+ 	usval = sval ? strlen(sval) : 0;
+ 	if (usval > 255)
+ 	  usval = 255;
++        CHECK_LIMIT(usval + 1);
+ 	*p++ = (unsigned char)usval;
+ 	memcpy(p, sval, usval);
+ 	p += usval;
+ 	break;
+       }
+ 
++#undef CHECK_LIMIT
+   va_end(ap);	/* clean up variable argument pointer */
+   
+   j = p - sav - 2;
+-  PUTSHORT(j, sav);     /* Now, store real RDLength */
++ /* this has already been checked against limit before */
++ PUTSHORT(j, sav);     /* Now, store real RDLength */
+   
+   /* check for overflow of buffer */
+   if (limit && ((unsigned char *)limit - p) < 0)
+     {
++truncated:
+       if (truncp)
+ 	*truncp = 1;
+       return 0;
+@@ -1472,7 +1510,6 @@ size_t answer_request(struct dns_header *header, char *limit, size_t qlen,
+   unsigned short flag;
+   int q, ans, anscount = 0, addncount = 0;
+   int dryrun = 0, sec_reqd = 0, have_pseudoheader = 0;
+-  int is_sign;
+   struct crec *crecp;
+   int nxdomain = 0, auth = 1, trunc = 0, sec_data = 1;
+   struct mx_srv_record *rec;
+@@ -1492,28 +1529,19 @@ size_t answer_request(struct dns_header *header, char *limit, size_t qlen,
+      forward rather than answering from the cache, which doesn't include
+      security information, unless we're in DNSSEC validation mode. */
+ 
+-  if (find_pseudoheader(header, qlen, NULL, &pheader, &is_sign))
++  if (find_pseudoheader(header, qlen, NULL, &pheader, NULL))
+     { 
+-      unsigned short udpsz, flags;
+-      unsigned char *psave = pheader;
+-
++      unsigned short flags;
++      
+       have_pseudoheader = 1;
+ 
+-      GETSHORT(udpsz, pheader);
+-      pheader += 2; /* ext_rcode */
++      pheader += 4; /* udp size, ext_rcode */
+       GETSHORT(flags, pheader);
+       
+       if ((sec_reqd = flags & 0x8000))
+ 	*do_bit = 1;/* do bit */ 
+-      *ad_reqd = 1;
+-
+-      /* If our client is advertising a larger UDP packet size
+-	 than we allow, trim it so that we don't get an overlarge
+-	 response from upstream */
+-
+-      if (!is_sign && (udpsz > daemon->edns_pktsz))
+-	PUTSHORT(daemon->edns_pktsz, psave); 
+ 
++      *ad_reqd = 1;
+       dryrun = 1;
+     }
+ 
+diff --git a/src/rfc2131.c b/src/rfc2131.c
+index 5c90408..6d954a0 100644
+--- a/src/rfc2131.c
++++ b/src/rfc2131.c
+@@ -2320,10 +2320,10 @@ static void do_options(struct dhcp_context *context,
+ 
+ 	      if (fqdn_flags & 0x04)
+ 		{
+-		  p = do_rfc1035_name(p, hostname);
++		  p = do_rfc1035_name(p, hostname, NULL);
+ 		  if (domain)
+ 		    {
+-		      p = do_rfc1035_name(p, domain);
++		      p = do_rfc1035_name(p, domain, NULL);
+ 		      *p++ = 0;
+ 		    }
+ 		}
+diff --git a/src/rfc3315.c b/src/rfc3315.c
+index 5ebf09d..795042c 100644
+--- a/src/rfc3315.c
++++ b/src/rfc3315.c
+@@ -206,6 +206,9 @@ static int dhcp6_maybe_relay(struct state *state, void *inbuff, size_t sz,
+   /* RFC-6939 */
+   if ((opt = opt6_find(opts, end, OPTION6_CLIENT_MAC, 3)))
+     {
++      if (opt6_len(opt) - 2 > DHCP_CHADDR_MAX) {
++        return 0;
++      }
+       state->mac_type = opt6_uint(opt, 0, 2);
+       state->mac_len = opt6_len(opt) - 2;
+       memcpy(&state->mac[0], opt6_ptr(opt, 2), state->mac_len);
+@@ -213,6 +216,9 @@ static int dhcp6_maybe_relay(struct state *state, void *inbuff, size_t sz,
+   
+   for (opt = opts; opt; opt = opt6_next(opt, end))
+     {
++      if (opt6_ptr(opt, 0) + opt6_len(opt) >= end) {
++        return 0;
++      }
+       int o = new_opt6(opt6_type(opt));
+       if (opt6_type(opt) == OPTION6_RELAY_MSG)
+ 	{
+@@ -1440,10 +1446,10 @@ static struct dhcp_netid *add_options(struct state *state, int do_refresh)
+       if ((p = expand(len + 2)))
+ 	{
+ 	  *(p++) = state->fqdn_flags;
+-	  p = do_rfc1035_name(p, state->hostname);
++	  p = do_rfc1035_name(p, state->hostname, NULL);
+ 	  if (state->send_domain)
+ 	    {
+-	      p = do_rfc1035_name(p, state->send_domain);
++	      p = do_rfc1035_name(p, state->send_domain, NULL);
+ 	      *p = 0;
+ 	    }
+ 	}
+diff --git a/src/tables.c b/src/tables.c
+index 834f119..dcdef79 100644
+--- a/src/tables.c
++++ b/src/tables.c
+@@ -20,6 +20,10 @@
+ 
+ #if defined(HAVE_IPSET) && defined(HAVE_BSD_NETWORK)
+ 
++#ifndef __FreeBSD__
++#include <bsd/string.h>
++#endif
++
+ #include <sys/types.h>
+ #include <sys/ioctl.h>
+ 
+@@ -136,7 +140,7 @@ int add_to_ipset(const char *setname, const struct all_addr *ipaddr,
+       return -1;
+     }
+   
+-  if (rc = pfr_add_tables(&table, 1, &n, 0)) 
++  if ((rc = pfr_add_tables(&table, 1, &n, 0))) 
+     {
+       my_syslog(LOG_WARNING, _("warning: pfr_add_tables: %s(%d)"),
+ 		pfr_strerror(errno),rc);
+diff --git a/src/util.c b/src/util.c
+index a729f33..c5b8bdd 100644
+--- a/src/util.c
++++ b/src/util.c
+@@ -218,15 +218,22 @@ char *canonicalise(char *in, int *nomem)
+   return ret;
+ }
+ 
+-unsigned char *do_rfc1035_name(unsigned char *p, char *sval)
++unsigned char *do_rfc1035_name(unsigned char *p, char *sval, char *limit)
+ {
+   int j;
+   
+   while (sval && *sval)
+     {
++      if (limit && p + 1 > (unsigned char*)limit)
++        return p;
++
+       unsigned char *cp = p++;
+       for (j = 0; *sval && (*sval != '.'); sval++, j++)
++      {
++          if (limit && p + 1 > (unsigned char*)limit)
++            return p;
+ 	*p++ = *sval;
++      }
+       *cp  = j;
+       if (*sval)
+ 	sval++;
+diff --git a/trust-anchors.conf b/trust-anchors.conf
+index afda518..6f807cf 100644
+--- a/trust-anchors.conf
++++ b/trust-anchors.conf
+@@ -1,9 +1,10 @@
+-# The root DNSSEC trust anchor, valid as at 30/01/2014
++# The root DNSSEC trust anchor, valid as at 10/02/2017
+ 
+ # Note that this is a DS record (ie a hash of the root Zone Signing Key) 
+ # If was downloaded from https://data.iana.org/root-anchors/root-anchors.xml
+ 
+ trust-anchor=.,19036,8,2,49AAC11D7B6F6446702E54A1607371607A1A41855200FD2CE1CDDE32F24E8FB5
++trust-anchor=.,20326,8,2,E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D
+ 
+ 
+ 

@@ -1,0 +1,73 @@
+#!/bin/bash -e
+
+CURDIR=$(pwd)
+GROUP=$(id -g -n)
+DNSPORT=5353
+IPV4PREFIX='192.168.21'
+
+function exit_handler()
+{
+    if test -f "$AUTOPKGTEST_TMP/dnsmasq.pid"; then
+	kill -TERM $(cat "$AUTOPKGTEST_TMP/dnsmasq.pid") || true
+    fi
+    sleep 1;
+    if test -f "$AUTOPKGTEST_ARTIFACTS/dnsmasq.log"; then
+	cat "$AUTOPKGTEST_ARTIFACTS/dnsmasq.log"
+    fi
+}
+trap exit_handler EXIT
+
+
+tee $AUTOPKGTEST_TMP/dnsmasq-hosts.conf <<EOF
+$IPV4PREFIX.19    dns dhcp
+$IPV4PREFIX.238    proxy wpad
+$IPV4PREFIX.253    switch
+$IPV4PREFIX.254    gwdij
+EOF
+
+tee  $AUTOPKGTEST_TMP/dnsmasq.conf <<EOF
+#### DNS ####
+domain-needed
+# forwarders
+server=8.8.8.8
+# A and AAAA
+addn-hosts=$AUTOPKGTEST_TMP/dnsmasq-hosts.conf
+expand-hosts
+domain=test
+port = $DNSPORT
+user = $USER
+group = $GROUP
+
+log-facility=$AUTOPKGTEST_ARTIFACTS/dnsmasq.log
+
+log-dhcp
+dhcp-alternate-port = 1067, 1068
+dhcp-range=$IPV4PREFIX.20,$IPV4PREFIX.50,12h
+dhcp-option=option:netmask,255.255.255.0
+dhcp-option=option:router,$IPV4PREFIX.254
+dhcp-option=option:dns-server,$IPV4PREFIX.254
+dhcp-option=option:ntp-server,$IPV4PREFIX.254
+dhcp-option=option:domain-name,test
+dhcp-host=2c:27:d7:01:71:08,$IPV4PREFIX.111
+EOF
+
+
+dnsmasq --conf-file="$AUTOPKGTEST_TMP/dnsmasq.conf" --pid-file="$AUTOPKGTEST_TMP/dnsmasq.pid"
+
+#RFC 6761
+echo -n "Test dhcp.test IPv4..."
+TEST=$(dig -4 '@127.0.0.1' -p $DNSPORT dhcp.test. A +short)
+echo "$TEST"
+test "x$TEST" = x"$IPV4PREFIX.19"
+
+echo -n "Test dhcp.test IPv6..."
+TEST=$(dig -6 '@::1' -p $DNSPORT dhcp.test. A +short)
+echo "$TEST"
+test "x$TEST" = x"$IPV4PREFIX.19"
+
+echo -n "Test www.invalid..."
+TEST=$(dig -4 @127.0.0.1 -p $DNSPORT www.invalid. A +short)
+echo \""$TEST"\"
+test "x$TEST" = 'x'
+
+

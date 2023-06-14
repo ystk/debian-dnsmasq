@@ -1,0 +1,109 @@
+#!/bin/bash -ex
+
+function exit_handler()
+{
+    if test -f "$AUTOPKGTEST_TMP/dnsmasq.pid"; then
+	kill -TERM $(cat "$AUTOPKGTEST_TMP/dnsmasq.pid") || true
+    fi
+    if test -f "$AUTOPKGTEST_TMP/dhclient.pid"; then
+	kill -TERM $(cat "$AUTOPKGTEST_TMP/dhclient.pid") || true
+    fi
+    if test -n "$DUMPCAPS"; then
+	kill -TERM $DUMPCAPS || true
+    fi
+    if test -n "$DUMPCAPC"; then
+	kill -TERM $DUMPCAPC || true
+    fi
+    sleep 1
+    if test -f  "$AUTOPKGTEST_ARTIFACTS/dnsmasq.log"; then
+	cat "$AUTOPKGTEST_ARTIFACTS/dnsmasq.log"
+    fi
+}
+
+trap exit_handler EXIT
+
+INTNUMBER="$RANDOM"
+IPV4PREFIX='192.168.21'
+IPV4SERVER="$IPV4PREFIX.19"
+IPV6SERVER="fde5:fa1b:907b::19"
+CLIENTMAC=06:06:06:06:06:06
+ip link add veth-s-$INTNUMBER type veth peer name veth-c-$INTNUMBER || exit 77
+ip addr add "$IPV4SERVER/24" dev veth-s-$INTNUMBER || exit 77
+ip addr add "$IPV6SERVER/48" dev veth-s-$INTNUMBER || exit 77
+ip link set dev veth-c-$INTNUMBER down
+ip link set dev veth-c-$INTNUMBER address $CLIENTMAC
+ip link set dev veth-s-$INTNUMBER up
+ip link set dev veth-c-$INTNUMBER up
+
+echo "show ip addr"
+echo "------------------------------------------------------"
+ip addr
+echo "------------------------------------------------------"
+
+tee $AUTOPKGTEST_TMP/dnsmasq-hosts.conf <<EOF
+$IPV4PREFIX.19    dns dhcp
+$IPV4PREFIX.238    proxy wpad
+$IPV4PREFIX.253    switch
+$IPV4PREFIX.254    gwdij
+EOF
+
+tee  $AUTOPKGTEST_TMP/dnsmasq.conf <<EOF
+#### DNS ####
+domain-needed
+# forwarders
+server=8.8.8.8
+# A and AAAA files
+addn-hosts=$AUTOPKGTEST_TMP/dnsmasq-hosts.conf
+expand-hosts
+domain=test
+bind-interfaces
+except-interface=lo
+interface=veth-s-$INTNUMBER
+
+log-facility=$AUTOPKGTEST_ARTIFACTS/dnsmasq.log
+
+log-dhcp
+dhcp-range=$IPV4PREFIX.20,$IPV4PREFIX.50,12h
+dhcp-option=option:netmask,255.255.255.0
+dhcp-option=option:router,$IPV4PREFIX.254
+dhcp-option=option:dns-server,$IPV4PREFIX.254
+dhcp-option=option:ntp-server,$IPV4PREFIX.254
+dhcp-option=option:domain-name,test
+dhcp-host=$CLIENTMAC,$IPV4PREFIX.111
+EOF
+
+
+
+
+dnsmasq --conf-file="$AUTOPKGTEST_TMP/dnsmasq.conf" --pid-file="$AUTOPKGTEST_TMP/dnsmasq.pid"
+
+#RFC 6761
+echo -n "Test dhcp.test IPv4..."
+TEST=$(dig -4 "@$IPV4SERVER" dhcp.test. A +short)
+echo "$TEST"
+test "x$TEST" = x"$IPV4PREFIX.19"
+
+echo -n "Test dhcp.test IPv6..."
+TEST=$(dig -6 "@$IPV6SERVER" dhcp.test. A +short)
+echo "$TEST"
+test "x$TEST" = x"$IPV4PREFIX.19"
+
+echo -n "Test www.invalid..."
+TEST=$(dig -4 "@$IPV4SERVER" www.invalid. A +short)
+echo \""$TEST"\"
+test "x$TEST" = 'x'
+
+tshark -i veth-c-$INTNUMBER -w "$AUTOPKGTEST_ARTIFACTS/veth-c-$INTNUMBER.cap" > /dev/null &
+DUMPCAPS=$!
+tshark -i veth-s-$INTNUMBER -w "$AUTOPKGTEST_ARTIFACTS/veth-m-$INTNUMBER.cap" > /dev/null &
+DUMPCAPC=$!
+
+echo "Test dhclient"
+timeout -k 300s 240s dhclient -1 -v -pf "$AUTOPKGTEST_TMP/dhclient.pid" veth-c-$INTNUMBER
+
+echo "show ip addr"
+echo "------------------------------------------------------"
+ip addr
+echo "------------------------------------------------------"
+
+LANG=C ip addr show veth-c-$INTNUMBER | grep "inet $IPV4PREFIX.111/24 brd 192.168.21.255 scope global"

@@ -527,7 +527,7 @@ static size_t add_pseudoheader(struct dns_header *header, size_t plen, unsigned 
 	return plen;
       *p++ = 0; /* empty name */
       PUTSHORT(T_OPT, p);
-      PUTSHORT(SAFE_PKTSZ, p); /* max packet length, this will be overwritten */
+      PUTSHORT(daemon->edns_pktsz, p); /* max packet length */
       PUTSHORT(0, p);    /* extended RCODE and version */
       PUTSHORT(set_do ? 0x8000 : 0, p); /* DO flag */
       lenp = p;
@@ -1198,10 +1198,7 @@ unsigned int extract_request(struct dns_header *header, size_t qlen, char *name,
 size_t setup_reply(struct dns_header *header, size_t qlen,
 		struct all_addr *addrp, unsigned int flags, unsigned long ttl)
 {
-  unsigned char *p;
-
-  if (!(p = skip_questions(header, qlen)))
-    return 0;
+  unsigned char *p = skip_questions(header, qlen);
   
   /* clear authoritative and truncated flags, set QR flag */
   header->hb3 = (header->hb3 & ~(HB3_AA | HB3_TC)) | HB3_QR;
@@ -1217,7 +1214,7 @@ size_t setup_reply(struct dns_header *header, size_t qlen,
     SET_RCODE(header, NOERROR); /* empty domain */
   else if (flags == F_NXDOMAIN)
     SET_RCODE(header, NXDOMAIN);
-  else if (flags == F_IPV4)
+  else if (p && flags == F_IPV4)
     { /* we know the address */
       SET_RCODE(header, NOERROR);
       header->ancount = htons(1);
@@ -1225,7 +1222,7 @@ size_t setup_reply(struct dns_header *header, size_t qlen,
       add_resource_record(header, NULL, NULL, sizeof(struct dns_header), &p, ttl, NULL, T_A, C_IN, "4", addrp);
     }
 #ifdef HAVE_IPV6
-  else if (flags == F_IPV6)
+  else if (p && flags == F_IPV6)
     {
       SET_RCODE(header, NOERROR);
       header->ancount = htons(1);
@@ -1331,7 +1328,6 @@ int check_for_bogus_wildcard(struct dns_header *header, size_t qlen, char *name,
   return 0;
 }
 
-
 int add_resource_record(struct dns_header *header, char *limit, int *truncp, int nameoffset, unsigned char **pp, 
 			unsigned long ttl, int *offset, unsigned short type, unsigned short class, char *format, ...)
 {
@@ -1341,47 +1337,29 @@ int add_resource_record(struct dns_header *header, char *limit, int *truncp, int
   unsigned short usval;
   long lval;
   char *sval;
-#define CHECK_LIMIT(size) \
-  if (limit && p + (size) > (unsigned char*)limit) \
-    { \
-      va_end(ap); \
-      goto truncated; \
-    }
 
   if (truncp && *truncp)
     return 0;
-
+ 
   va_start(ap, format);   /* make ap point to 1st unamed argument */
-
+  
   if (nameoffset > 0)
     {
-      CHECK_LIMIT(2);
       PUTSHORT(nameoffset | 0xc000, p);
     }
   else
     {
       char *name = va_arg(ap, char *);
-      if (name && !(p = do_rfc1035_name(p, name, limit)))
-	{
-	  va_end(ap);
-	  goto truncated;
-	}
-      
+      if (name)
+	p = do_rfc1035_name(p, name);
       if (nameoffset < 0)
 	{
-	  CHECK_LIMIT(2);
 	  PUTSHORT(-nameoffset | 0xc000, p);
 	}
       else
-	{
-	  CHECK_LIMIT(1);
-	  *p++ = 0;
-	}
+	*p++ = 0;
     }
 
-  /* type (2) + class (2) + ttl (4) + rdlen (2) */
-  CHECK_LIMIT(10);
-  
   PUTSHORT(type, p);
   PUTSHORT(class, p);
   PUTLONG(ttl, p);      /* TTL */
@@ -1394,7 +1372,6 @@ int add_resource_record(struct dns_header *header, char *limit, int *truncp, int
       {
 #ifdef HAVE_IPV6
       case '6':
-        CHECK_LIMIT(IN6ADDRSZ);
 	sval = va_arg(ap, char *); 
 	memcpy(p, sval, IN6ADDRSZ);
 	p += IN6ADDRSZ;
@@ -1402,47 +1379,36 @@ int add_resource_record(struct dns_header *header, char *limit, int *truncp, int
 #endif
 	
       case '4':
-        CHECK_LIMIT(INADDRSZ);
 	sval = va_arg(ap, char *); 
 	memcpy(p, sval, INADDRSZ);
 	p += INADDRSZ;
 	break;
 	
       case 'b':
-        CHECK_LIMIT(1);
 	usval = va_arg(ap, int);
 	*p++ = usval;
 	break;
 	
       case 's':
-        CHECK_LIMIT(2);
 	usval = va_arg(ap, int);
 	PUTSHORT(usval, p);
 	break;
 	
       case 'l':
-        CHECK_LIMIT(4);
 	lval = va_arg(ap, long);
 	PUTLONG(lval, p);
 	break;
 	
       case 'd':
-        /* get domain-name answer arg and store it in RDATA field */
-        if (offset)
-          *offset = p - (unsigned char *)header;
-        p = do_rfc1035_name(p, va_arg(ap, char *), limit);
-        if (!p)
-          {
-            va_end(ap);
-            goto truncated;
-          }
-        CHECK_LIMIT(1);
-        *p++ = 0;
+	/* get domain-name answer arg and store it in RDATA field */
+	if (offset)
+	  *offset = p - (unsigned char *)header;
+	p = do_rfc1035_name(p, va_arg(ap, char *));
+	*p++ = 0;
 	break;
 	
       case 't':
 	usval = va_arg(ap, int);
-        CHECK_LIMIT(usval);
 	sval = va_arg(ap, char *);
 	if (usval != 0)
 	  memcpy(p, sval, usval);
@@ -1454,24 +1420,20 @@ int add_resource_record(struct dns_header *header, char *limit, int *truncp, int
 	usval = sval ? strlen(sval) : 0;
 	if (usval > 255)
 	  usval = 255;
-        CHECK_LIMIT(usval + 1);
 	*p++ = (unsigned char)usval;
 	memcpy(p, sval, usval);
 	p += usval;
 	break;
       }
 
-#undef CHECK_LIMIT
   va_end(ap);	/* clean up variable argument pointer */
   
   j = p - sav - 2;
- /* this has already been checked against limit before */
- PUTSHORT(j, sav);     /* Now, store real RDLength */
+  PUTSHORT(j, sav);     /* Now, store real RDLength */
   
   /* check for overflow of buffer */
   if (limit && ((unsigned char *)limit - p) < 0)
     {
-truncated:
       if (truncp)
 	*truncp = 1;
       return 0;
@@ -1510,6 +1472,7 @@ size_t answer_request(struct dns_header *header, char *limit, size_t qlen,
   unsigned short flag;
   int q, ans, anscount = 0, addncount = 0;
   int dryrun = 0, sec_reqd = 0, have_pseudoheader = 0;
+  int is_sign;
   struct crec *crecp;
   int nxdomain = 0, auth = 1, trunc = 0, sec_data = 1;
   struct mx_srv_record *rec;
@@ -1529,19 +1492,28 @@ size_t answer_request(struct dns_header *header, char *limit, size_t qlen,
      forward rather than answering from the cache, which doesn't include
      security information, unless we're in DNSSEC validation mode. */
 
-  if (find_pseudoheader(header, qlen, NULL, &pheader, NULL))
+  if (find_pseudoheader(header, qlen, NULL, &pheader, &is_sign))
     { 
-      unsigned short flags;
-      
+      unsigned short udpsz, flags;
+      unsigned char *psave = pheader;
+
       have_pseudoheader = 1;
 
-      pheader += 4; /* udp size, ext_rcode */
+      GETSHORT(udpsz, pheader);
+      pheader += 2; /* ext_rcode */
       GETSHORT(flags, pheader);
       
       if ((sec_reqd = flags & 0x8000))
 	*do_bit = 1;/* do bit */ 
-
       *ad_reqd = 1;
+
+      /* If our client is advertising a larger UDP packet size
+	 than we allow, trim it so that we don't get an overlarge
+	 response from upstream */
+
+      if (!is_sign && (udpsz > daemon->edns_pktsz))
+	PUTSHORT(daemon->edns_pktsz, psave); 
+
       dryrun = 1;
     }
 

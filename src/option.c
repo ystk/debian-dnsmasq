@@ -1326,7 +1326,7 @@ static int parse_dhcp_opt(char *errstr, char *arg, int flags)
 		    }
 		  
 		  p = newp;
-		  end = do_rfc1035_name(p + len, dom, NULL);
+		  end = do_rfc1035_name(p + len, dom);
 		  *end++ = 0;
 		  len = end - p;
 		  free(dom);
@@ -4394,19 +4394,15 @@ void read_opts(int argc, char **argv, char *compile_opts)
     {
       struct server *tmp;
       for (tmp = daemon->servers; tmp; tmp = tmp->next)
-	{
-	  tmp->edns_pktsz = daemon->edns_pktsz;
-	 
-	  if (!(tmp->flags & SERV_HAS_SOURCE))
-	    {
-	      if (tmp->source_addr.sa.sa_family == AF_INET)
-		tmp->source_addr.in.sin_port = htons(daemon->query_port);
+	if (!(tmp->flags & SERV_HAS_SOURCE))
+	  {
+	    if (tmp->source_addr.sa.sa_family == AF_INET)
+	      tmp->source_addr.in.sin_port = htons(daemon->query_port);
 #ifdef HAVE_IPV6
-	      else if (tmp->source_addr.sa.sa_family == AF_INET6)
-		tmp->source_addr.in6.sin6_port = htons(daemon->query_port);
+	    else if (tmp->source_addr.sa.sa_family == AF_INET6)
+	      tmp->source_addr.in6.sin6_port = htons(daemon->query_port);
 #endif 
-	    }
-	} 
+	  } 
     }
   
   if (daemon->if_addrs)

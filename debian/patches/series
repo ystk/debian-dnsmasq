@@ -1,0 +1,4 @@
+0001-deb8u6.patch
+0002-Subject-CVE-2019-14834-Fix-memory-leak-in-helper.c.patch
+0003-PATCH-Fix-write-after-free-error-in-DHCPv6-code.-CVE.patch
+0004-CVE-2023-28450-Set-the-default-maximum-DNS-UDP-packe.patch

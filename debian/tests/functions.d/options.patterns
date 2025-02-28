@@ -1,0 +1,1 @@
+compile time options: IPv6 GNU-getopt DBus i18n IDN DHCP DHCPv6 no-Lua TFTP conntrack ipset auth no-DNSSEC loop-detect

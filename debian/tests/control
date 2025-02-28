@@ -1,12 +1,6 @@
-Tests: smoke-test
-Depends: @, bash, dnsutils | bind9-utils | bind9utils
-Restrictions: allow-stderr
+Tests: compile-time-options
+Depends: dnsmasq,
+         dnsmasq-base,
+Restrictions: needs-root,
+              isolation-container,
 
-Tests: dhcp-test
-Depends: @, bash, dnsutils | bind9-utils | bind9utils, iproute2, isc-dhcp-client, wireshark-common, tshark
-Restrictions: allow-stderr, needs-root, isolation-container
-
-# disable syntax error with older dnsmasq
-#Tests: udp-packet-size-test
-#Depends: @, bash, dnsutils | bind9-utils | bind9utils
-#Restrictions: allow-stderr

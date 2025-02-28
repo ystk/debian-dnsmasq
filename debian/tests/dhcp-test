@@ -35,6 +35,12 @@ ip link set dev veth-c-$INTNUMBER address $CLIENTMAC
 ip link set dev veth-s-$INTNUMBER up
 ip link set dev veth-c-$INTNUMBER up
 
+# This is a gross hack to make DHCP work.
+# See https://bugs.debian.org/796558
+# DHCP will fail on virtual interfaces since dnsmasq will not fill out the UDP checksum
+# and there is no UDP checksum offload on typical virtual interfaces
+iptables -t mangle -A OUTPUT -o veth-s-$INTNUMBER -p udp -m udp --dport 68 -j CHECKSUM --checksum-fill
+
 echo "show ip addr"
 echo "------------------------------------------------------"
 ip addr

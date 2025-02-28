@@ -21,6 +21,8 @@ LDFLAGS = $(shell $(dpkg_buildflags) --get LDFLAGS)
 
 DEB_COPTS = $(COPTS)
 
+DEB_BUILD_OPTIONS = nodnssec
+
 TARGET = install-i18n
 
 DEB_HOST_ARCH_OS := $(shell dpkg-architecture -qDEB_HOST_ARCH_OS)

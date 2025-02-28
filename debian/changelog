@@ -1,3 +1,16 @@
+dnsmasq (2.72-3+deb8u8) jessie-security; urgency=medium
+
+  * Non-maintainer upload by the ELTS Security Team.
+  * Remove DNSSEC support, fixing:
+    - CVE-2023-50387 (aka the "KeyTrap" issue).
+    - CVE-2023-50868 (aka the "NSEC3" issue).
+  * Add debian/gbp.conf.
+  * Backport autopkgtests, remove lua tests
+  * Include salsa CI tests for jessie
+  * Fix autopkgtest build dependencies
+
+ -- Lee Garrett <debian@rocketjump.eu>  Wed, 26 Feb 2025 18:17:53 +0100
+
 dnsmasq (2.72-3+deb8u7) jessie-security; urgency=high
 
   * Non-maintainer upload by the ELTS Security Team.
